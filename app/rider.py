@@ -1,0 +1,301 @@
+import sympy as sp
+import numpy as np
+import matplotlib.pyplot as plt
+from scipy.optimize import root_scalar, curve_fit
+import os, sys
+import unittest
+from dotenv import load_dotenv
+load_dotenv()
+sys.path.append(os.getenv('APP_PATH'))
+
+
+
+from app.helpers import mps_to_mph  # Assuming this is defined in the helpers module
+from app.strava_calls import *
+
+
+class Rider:
+    """
+    A class to represent a cyclist and estimate their aerodynamic drag coefficient (CdA).
+    
+    Attributes:
+        height (float): Height of the rider in meters.
+        weight (float): Weight of the rider in kilograms.
+        bike_type (str): Type of bike (e.g., "Road", "TT", "Gravel", "MTB").
+        position (str): Riding position (e.g., "Hoods", "Drops", "Aero").
+        CdA (float): Estimated aerodynamic drag coefficient.
+        critical_power (float): Critical power in watts.
+        WTank (float): Estimated WTank in joules.
+    """
+
+    # Default CdA values for different bike types and positions (m^2)
+    BIKE_TYPE_CDA = {
+        "Road": {"Hoods": 0.35, "Drops": 0.33, "Aero": 0.30},
+        "TT": {"Aero": 0.22},
+        "Gravel": {"Hoods": 0.38, "Drops": 0.36},
+        "MTB": {"Flat": 0.40},
+    }
+
+    def __init__(self, height, weight, bike_type="Road", position="Hoods", rider_type=None, critical_power=None, days=60):
+        self.height = height  # Rider height in meters
+        self.weight = weight  # Rider weight in kilograms
+        self.bike_type = bike_type  # Bike type (e.g., Road, TT, Gravel, MTB)
+        self.position = position  # Riding position (e.g., Hoods, Drops, Aero)
+        self.CdA = self.estimate_CdA()
+        if rider_type:
+            self.critical_power = critical_power
+
+        if rider_type and critical_power:
+            self.WTank = self.calculate_w_tank_from_profile(rider_type, critical_power)
+        else:
+            try:
+                self.WTank_calculator = self.calculate_w_tank_from_curve_fit(critical_power, days)
+                self.WTank = self.WTank_calculator.calculate_w_tank()
+                self.WTank_calculator.plot_power_duration_curve()
+                self.critical_power = self.WTank_calculator.critical_power
+                
+            except Exception as e:
+                print(f"Error calculating WTank, user probably not authenticated from strava, see error: {e}")
+                print('OR you need to include a rider_type and critical_power')
+
+    def estimate_CdA(self):
+        """
+        Estimate the aerodynamic drag coefficient (CdA) based on rider and bike factors.
+
+        Returns:
+            float: Estimated CdA value in m^2.
+        """
+        # Get baseline CdA based on bike type and position
+        base_CdA = self.BIKE_TYPE_CDA.get(self.bike_type, {}).get(self.position, 0.35)
+
+        # Adjustments based on height and weight (optional scaling factors)
+        # Taller riders tend to have higher CdA due to larger frontal area
+        height_factor = self.height / 1.75  # Normalize to average rider height (1.75m)
+
+        # Adjust CdA for height, ensuring adjustments are reasonable
+        adjusted_CdA = base_CdA * height_factor
+
+        return round(adjusted_CdA, 3)
+
+    def calculate_w_tank_from_profile(self, rider_type, critical_power):
+        """
+        Calculate WTank based on rider type and critical power.
+
+        Args:
+            rider_type (str): Type of rider (e.g., "time_trialist", "sprinter", "all_rounder").
+            critical_power (float): Critical power in watts.
+
+        Returns:
+            float: Estimated WTank in joules.
+        """
+        wt_calculator = WTankCalculator(rider_type=rider_type, critical_power=critical_power)
+        return wt_calculator.calculate_w_tank()
+
+    def calculate_w_tank_from_curve_fit(self, critical_power, days):
+        """
+        Calculate WTank using curve fitting based on activities from the past `days` days.
+
+        Args:
+            critical_power (float): Critical power in watts.
+            days (int): Number of days to look back for activities.
+
+        Returns:
+            float: Estimated WTank in joules.
+        """
+        activities = get_activities(days)
+        durations = [30, 60, 120, 300, 1200, 60*30]  # Durations in seconds (5s, 30s, 1min, 5min, 20min)
+        best_efforts = calculate_critical_power(activities, durations)
+        print('this is calculate_w_tank_fromZ_curve_fit critical power (should be none): ', critical_power)
+        wt_calculator = WTankCalculator(critical_power=critical_power, best_efforts=best_efforts)
+        
+        return wt_calculator
+    
+
+    def update_height(self, height):
+        """Update the height of the rider and recalculate CdA."""
+        self.height = height
+        self.CdA = self.estimate_CdA()
+
+    def update_weight(self, weight):
+        """Update the weight of the rider."""
+        self.weight = weight
+
+    def update_bike_type(self, bike_type):
+        """Update the bike type and recalculate CdA."""
+        self.bike_type = bike_type
+        self.CdA = self.estimate_CdA()
+
+    def update_position(self, position):
+        """Update the riding position and recalculate CdA."""
+        self.position = position
+        self.CdA = self.estimate_CdA()
+
+
+    def __str__(self):
+        """String representation of the Rider instance."""
+        return (f"Rider: {self.height}m, {self.weight}kg, Bike: {self.bike_type}, "
+                f"Position: {self.position}, Estimated CdA: {self.CdA} m^2, "
+                f"Critical Power: {self.critical_power} W, WTank: {self.WTank/1000} kJ")
+
+class WTankCalculator:
+    def __init__(self, rider_type=None, critical_power=None, best_efforts=None):
+        """
+        Initialize the WTankCalculator class.
+
+        :param rider_type: str, one of ['time_trialist', 'sprinter', 'all_rounder']
+        :param critical_power: float, critical power in watts.
+        :param best_efforts: dict, best power outputs for durations in seconds.
+                             e.g., {60: 400, 300: 350, 600: 330, 1200: 310, 1800: 290}
+        """
+        self.rider_type = rider_type
+        self.critical_power = critical_power
+        self.best_efforts = best_efforts if best_efforts else {}
+
+    def _populate_best_efforts(self):
+        """
+        Populate estimated best efforts if not provided, based on rider type and critical power.
+        """
+        if not self.critical_power:
+            raise ValueError("Critical power must be provided to estimate best efforts.")
+
+        # Base multipliers for power at different durations (relative to critical power)
+        if self.rider_type == "time_trialist":
+            multipliers = {60: 1.4, 300: 1.2, 600: 1.1, 1200: 1.05, 1800: 1.02}
+        elif self.rider_type == "sprinter":
+            multipliers = {60: 1.8, 300: 1.4, 600: 1.2, 1200: 1.1, 1800: 1.05}
+        elif self.rider_type == "all_rounder":
+            multipliers = {60: 1.6, 300: 1.3, 600: 1.15, 1200: 1.08, 1800: 1.03}
+        else:
+            raise ValueError("Invalid rider type. Choose from 'time_trialist', 'sprinter', or 'all_rounder'.")
+
+        # Populate best efforts based on multipliers
+        for duration, multiplier in multipliers.items():
+            self.best_efforts[duration] = self.critical_power * multiplier
+
+    def _estimate_w_tank_from_profile(self):
+        """Estimate W' based on rider type and critical power."""
+        if self.rider_type == "time_trialist":
+            return 10_000 + 0.5 * self.critical_power
+        elif self.rider_type == "sprinter":
+            return 25_000 + 0.7 * self.critical_power
+        elif self.rider_type == "all_rounder":
+            return 15_000 + 0.6 * self.critical_power
+        else:
+            raise ValueError("Invalid rider type. Choose from 'time_trialist', 'sprinter', or 'all_rounder'.")
+
+    def _power_duration_model(self, t, CP, W_prime):
+        """Power-duration model: P(t) = CP + W'/t."""
+        return CP + W_prime / t
+
+    def _estimate_w_tank_from_curve(self):
+        """Estimate W' based on the power-duration curve."""
+        if not self.best_efforts:
+            self._populate_best_efforts()  # Populate best efforts if not provided
+
+        durations = np.array(list(self.best_efforts.keys()))
+        powers = np.array(list(self.best_efforts.values()))
+
+        # Curve fitting to estimate CP and W'
+        popt, _ = curve_fit(self._power_duration_model, durations, powers, bounds=(0, np.inf))
+        estimated_cp, w_prime = popt
+
+        # Store critical power if not provided
+        if self.critical_power is None:
+            self.critical_power = estimated_cp
+            print(f"Estimated Critical Power: {self.critical_power:.2f} W")
+
+        return w_prime
+
+    def calculate_w_tank(self):
+        """Calculate the WTank based on available data."""
+        if self.best_efforts:
+            self.w_tank = self._estimate_w_tank_from_curve()
+        elif self.rider_type and self.critical_power:
+            self.w_tank = self._estimate_w_tank_from_profile()
+        else:
+            raise ValueError("Provide either best efforts data or rider profile and critical power.")
+
+        return self.w_tank
+
+    def plot_power_duration_curve(self):
+        """Plot the power-duration curve if best efforts data is available."""
+        if not self.best_efforts:
+            self._populate_best_efforts()  # Populate best efforts if not provided
+
+        durations = np.array(list(self.best_efforts.keys()))
+        powers = np.array(list(self.best_efforts.values()))
+
+        # Fit the curve
+        popt, _ = curve_fit(self._power_duration_model, durations, powers, bounds=(0, np.inf))
+        estimated_cp, w_prime = popt
+
+        # Generate a smooth curve
+        t_fit = np.linspace(min(durations), max(durations), 500)
+        p_fit = self._power_duration_model(t_fit, *popt)
+
+        # Plot
+        plt.figure(figsize=(8, 5))
+        plt.scatter(durations, powers, color='red', label='Best Efforts Data')
+        plt.plot(t_fit, p_fit, label=f'Fitted Curve\nCP={estimated_cp:.2f} W, W\'={w_prime:.2f} J')
+        plt.axvline(y=estimated_cp, color='gray', linestyle='--', label=f'Critical Power: {estimated_cp:.2f} W')
+        plt.xlabel('Duration (s)')
+        plt.ylabel('Power (W)')
+        plt.title('Power-Duration Curve')
+        plt.legend()
+        plt.grid()
+        plt.show()
+
+def calculate_critical_power(activities, durations):
+    best_power = {duration: 0 for duration in durations}
+
+    for activity in activities:
+        activity_id = activity["id"]
+
+        try:
+            power_stream = get_power_stream(activity_id)
+        except Exception as e:
+            print(f"Error processing activity {activity_id}: {e}")
+            continue
+
+        for duration in durations:
+            if len(power_stream) >= duration:
+                avg_power = max(
+                    np.mean(power_stream[i:i + duration])
+                    for i in range(len(power_stream) - duration + 1)
+                )
+                best_power[duration] = max(best_power[duration], avg_power)
+
+    return best_power
+
+
+
+def get_critical_power_profile(days=60):
+    try:
+        print('Starting critical power profile calculation')
+        activities = get_activities(days)  # Retrieve activities from the past `days` days
+        print('Activities:', activities)
+        durations = [15, 30, 60, 120, 300, 1200, 60*30]  # Durations in seconds (5s, 30s, 1min, 5min, 20min)
+        critical_power = calculate_critical_power(activities, durations)
+
+        print("Critical Power Profile:")
+        for duration, power in critical_power.items():
+            print(f"{duration if duration < 60 else duration / 60}{'s' if duration < 60 else 'm'}: {power:.2f} watts")
+        
+        return critical_power
+    except Exception as e:
+        print(f"Error: {e}")
+        print("Traceback:")
+        print(traceback.format_exc())
+        return None
+
+
+
+
+# Example usage
+if __name__ == "__main__":
+    rider = Rider(height=1.75, weight=70, bike_type="Road", position="Hoods")
+    print(rider)
+
+
+
+

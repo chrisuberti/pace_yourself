@@ -3,16 +3,14 @@ import numpy as np
 import matplotlib.pyplot as plt
 from scipy.optimize import root_scalar, curve_fit
 import os, sys
+import sqlite3
 import unittest
 from dotenv import load_dotenv
 load_dotenv()
 sys.path.append(os.getenv('APP_PATH'))
 
-
-
 from app.helpers import mps_to_mph  # Assuming this is defined in the helpers module
 from app.strava_calls import *
-
 
 class Rider:
     """
@@ -26,6 +24,7 @@ class Rider:
         CdA (float): Estimated aerodynamic drag coefficient.
         critical_power (float): Critical power in watts.
         WTank (float): Estimated WTank in joules.
+        best_efforts (dict): Dictionary of best effort values.
     """
 
     # Default CdA values for different bike types and positions (m^2)
@@ -36,27 +35,57 @@ class Rider:
         "MTB": {"Flat": 0.40},
     }
 
-    def __init__(self, height, weight, bike_type="Road", position="Hoods", rider_type=None, critical_power=None, days=60):
+    def __init__(self, height, weight, bike_type="Road", position="Hoods", 
+                 rider_type=None, critical_power=None, 
+                 best_efforts=None, 
+                 days=60, rider_id=None):
         self.height = height  # Rider height in meters
         self.weight = weight  # Rider weight in kilograms
         self.bike_type = bike_type  # Bike type (e.g., Road, TT, Gravel, MTB)
         self.position = position  # Riding position (e.g., Hoods, Drops, Aero)
         self.CdA = self.estimate_CdA()
-        if rider_type:
-            self.critical_power = critical_power
+        self.critical_power = critical_power
+        self.WTank = None
+        
+        #if rider id isn't supplied, get the rider_id from strava
+        #rider id is used to store the best efforts in the database for strava calls so we don't hit hte api too much and get throttled
+        if (rider_id==None)&(rider_type==None)&(critical_power==None) & (best_efforts==None):
+            #make sure to only call this condition if there are no other ways to estimate power supplied
+            self.rider_id = get_athlete_id()
+        elif rider_id:
+            self.rider_id = rider_id
+        
+        #important block to populate critical power and WTank
 
         if rider_type and critical_power:
-            self.WTank = self.calculate_w_tank_from_profile(rider_type, critical_power)
-        else:
-            try:
-                self.WTank_calculator = self.calculate_w_tank_from_curve_fit(critical_power, days)
-                self.WTank = self.WTank_calculator.calculate_w_tank()
-                self.WTank_calculator.plot_power_duration_curve()
-                self.critical_power = self.WTank_calculator.critical_power
-                
-            except Exception as e:
-                print(f"Error calculating WTank, user probably not authenticated from strava, see error: {e}")
-                print('OR you need to include a rider_type and critical_power')
+            self.WTank_calculator = WTankCalculator(rider_type=rider_type, critical_power=critical_power)
+            self.WTank = self.WTank_calculator.calculate_w_tank()
+        else: 
+            #Try the few different methods in order to get your best_efforts variable if we're not estimating based on
+            #load the best efforts from the database if they exist and pull out all the rider_ids
+            # if the rider_id is not in the database, then we need to calculate the best efforts from strava
+
+            #check if the database exists
+            # if it does, pull out all the rider_ids
+            # if the rider_id is in the database, load the best efforts from the database
+            rider_ids = []
+            
+            if best_efforts:
+                self.best_efforts = best_efforts
+            elif rider_id in rider_ids:
+                self.load_best_efforts_from_db()
+            else:
+                try:
+                    #This one hit's the Strava API and is call intensive:
+                    best_efforts = self.get_best_power_from_strava(days)
+                    self.save_best_efforts_to_db()
+                except Exception as e:
+                    print(f"Error calculating WTank, user probably not authenticated from strava, see error: {e}")
+                    print('OR you need to include a rider_type and critical_power')
+
+            self.WTank_calculator = WTankCalculator(critical_power=critical_power, best_efforts=best_efforts)
+            self.WTank = self.WTank_calculator.calculate_w_tank()
+            self.critical_power = self.WTank_calculator.critical_power
 
     def estimate_CdA(self):
         """
@@ -91,25 +120,53 @@ class Rider:
         wt_calculator = WTankCalculator(rider_type=rider_type, critical_power=critical_power)
         return wt_calculator.calculate_w_tank()
 
-    def calculate_w_tank_from_curve_fit(self, critical_power, days):
+    def get_best_power_from_strava(self, days=30):
         """
         Calculate WTank using curve fitting based on activities from the past `days` days.
 
         Args:
-            critical_power (float): Critical power in watts.
             days (int): Number of days to look back for activities.
 
         Returns:
-            float: Estimated WTank in joules.
+            dict of best efforts
         """
         activities = get_activities(days)
-        durations = [30, 60, 120, 300, 1200, 60*30]  # Durations in seconds (5s, 30s, 1min, 5min, 20min)
-        best_efforts = calculate_critical_power(activities, durations)
-        print('this is calculate_w_tank_fromZ_curve_fit critical power (should be none): ', critical_power)
-        wt_calculator = WTankCalculator(critical_power=critical_power, best_efforts=best_efforts)
-        
-        return wt_calculator
-    
+        durations = [30, 60, 120, 300, 1200, 60*30]  # Durations in seconds (30s, 1min, 2min, 5min, 20min, 30min)
+        return calculate_critical_power(activities, durations)
+
+    def save_best_efforts_to_db(self):
+        """Save best efforts to a database."""
+        if not self.rider_id:
+            raise ValueError("Rider ID must be provided to save best efforts to the database.")
+
+        conn = sqlite3.connect('rider_data.db')
+        c = conn.cursor()
+        c.execute('''CREATE TABLE IF NOT EXISTS best_efforts (
+                        rider_id TEXT,
+                        duration INTEGER,
+                        power REAL,
+                        PRIMARY KEY (rider_id, duration)
+                    )''')
+
+        for duration, power in self.best_efforts.items():
+            c.execute('''INSERT OR REPLACE INTO best_efforts (rider_id, duration, power)
+                         VALUES (?, ?, ?)''', (self.rider_id, duration, power))
+
+        conn.commit()
+        conn.close()
+
+    def load_best_efforts_from_db(self):
+        """Load best efforts from a database."""
+        if not self.rider_id:
+            raise ValueError("Rider ID must be provided to load best efforts from the database.")
+
+        conn = sqlite3.connect('rider_data.db')
+        c = conn.cursor()
+        c.execute('''SELECT duration, power FROM best_efforts WHERE rider_id = ?''', (self.rider_id,))
+        rows = c.fetchall()
+        conn.close()
+
+        self.best_efforts = {duration: power for duration, power in rows}
 
     def update_height(self, height):
         """Update the height of the rider and recalculate CdA."""
@@ -129,7 +186,6 @@ class Rider:
         """Update the riding position and recalculate CdA."""
         self.position = position
         self.CdA = self.estimate_CdA()
-
 
     def __str__(self):
         """String representation of the Rider instance."""
@@ -202,7 +258,6 @@ class WTankCalculator:
         # Store critical power if not provided
         if self.critical_power is None:
             self.critical_power = estimated_cp
-            print(f"Estimated Critical Power: {self.critical_power:.2f} W")
 
         return w_prime
 
@@ -237,7 +292,7 @@ class WTankCalculator:
         plt.figure(figsize=(8, 5))
         plt.scatter(durations, powers, color='red', label='Best Efforts Data')
         plt.plot(t_fit, p_fit, label=f'Fitted Curve\nCP={estimated_cp:.2f} W, W\'={w_prime:.2f} J')
-        plt.axvline(y=estimated_cp, color='gray', linestyle='--', label=f'Critical Power: {estimated_cp:.2f} W')
+        plt.axvline(y=estimated_cp, color='gray', linestyle='--', label=f'W\'/CP = {w_prime / estimated_cp:.2f} s')
         plt.xlabel('Duration (s)')
         plt.ylabel('Power (W)')
         plt.title('Power-Duration Curve')
@@ -293,9 +348,17 @@ def get_critical_power_profile(days=60):
 
 # Example usage
 if __name__ == "__main__":
+    rider = Rider(height=1.75, weight=70, bike_type="Road", position="Hoods", rider_type="sprinter", critical_power=300)
+    print(rider)
+    rider.update_height(1.80)
+    print(rider)
+    rider.update_weight(75)
+    print(rider)
+    rider.update_bike_type("TT")
+    print(rider)
+    rider.update_position("Aero")
+    print(rider)
     rider = Rider(height=1.75, weight=70, bike_type="Road", position="Hoods")
     print(rider)
-
-
-
-
+    rider = Rider(height=1.75, weight=70, bike_type="Road", position="Hoods")
+    print(rider)

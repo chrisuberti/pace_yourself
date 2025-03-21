@@ -1,0 +1,7 @@
+{
+    "python.pythonPath": "/venv/Scripts/python.exe",  // On Windows
+    // "python.pythonPath": "./venv/bin/python",  // On macOS/Linux
+    "python.venvPath": "/venv",
+    "jupyter.jupyterServerType": "local",
+    "jupyter.notebookFileRoot": "${workspaceFolder}"
+  }

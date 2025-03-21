@@ -1,1 +1,12 @@
+numpy
+pandas
+matplotlib
+plotly
+pydeck
+requests
+scipy
+scikit-learn
 streamlit
+python-dotenv
+sympy
+jupyter

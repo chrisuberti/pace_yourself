@@ -73,7 +73,16 @@ if course:
             fig = plot_cumulative_distance_vs_altitude(course.df)
         st.plotly_chart(fig)
      
-     
+        # Add a button to save the processed course.df to a CSV file
+        if st.button("Save Processed Course Data"):
+            save_path = os.path.join(route_path, f"{segment_id}_processed_course.csv")
+            course.df.to_csv(save_path, index=False)
+            st.write(course.df.head())
+            st.success(f"Processed course data saved to {save_path}")
+
+        course.df.to_csv(os.path.join(route_path, segment_id+'_preprocessed_route.csv'), index=False)
+
+
 # Call the course_segmentation_slider function if manual segmentation is selected
 if segmentation_method == 'manual segmentation':
     st.sidebar.header("Manual Segmentation")

@@ -57,16 +57,41 @@ def create_map(df, color = 'altitude'):
     # Create the pydeck Deck object
     return pdk.Deck(layers=[layer], initial_view_state=view_state)
 
-def plot_cumulative_distance_vs_altitude(df, color = 'altitude'):
-    #df = create_color_map(df, color)
+def plot_cumulative_distance_vs_altitude(df, color='altitude'):
+    """
+    Plot cumulative distance vs altitude using a scatter plot to avoid connecting discontinuous segments.
 
-    fig = px.line(
-        df,
-        x='cumulative_distance',
-        y='altitude',
-       # color = color,
-        #title='Cumulative Distance vs Altitude',
-        labels={'cumulative_distance': 'Distance (km)', 'altitude': 'Altitude (m)'},
-        template='plotly_dark'  # Use the dark theme
-    )
+    Args:
+        df (pd.DataFrame): The DataFrame containing the data.
+        color (str): The column to use for coloring the plot.
+
+    Returns:
+        plotly.graph_objects.Figure: The generated plot.
+    """
+    
+    df = create_color_map(df, color)
+
+    if color == 'segment':
+        # Use discrete color scale for segments
+        fig = px.scatter(
+            df,
+            x='cumulative_distance',
+            y='altitude',
+            marker=dict(color='segment'),
+            labels={'cumulative_distance': 'Distance (km)', 'altitude': 'Altitude (m)', 'segment': 'Segment'},
+            template='plotly_dark',  # Use the dark theme
+            title="Cumulative Distance vs Altitude"
+        )
+    else:
+        # Use continuous color scale for other attributes
+        fig = px.scatter(
+            df,
+            x='cumulative_distance',
+            y='altitude',
+            color=color,
+            labels={'cumulative_distance': 'Distance (km)', 'altitude': 'Altitude (m)'},
+            template='plotly_dark',  # Use the dark theme
+            title="Cumulative Distance vs Altitude"
+        )
+
     return fig

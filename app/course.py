@@ -33,15 +33,21 @@ class Course:
         self.df["cumulative_distance"] = self.df["distance"].cumsum()
         # Calculate the gradient between two points
         self.df["delta_altitude"] = self.df["altitude"].diff()
+        self.df["height_gain"] = self.df["delta_altitude"].clip(lower=0)
+        self.df["height_loss"] = -self.df["delta_altitude"].clip(upper=0)
         # Handle inf values in the gradient and set them to zero
         self.df["gradient"] = (self.df["delta_altitude"] / self.df["distance"]) * 100
         self.df["gradient"] = self.df["gradient"].fillna(0)
         self.df['gradient'] = self.df['gradient'].replace([np.inf, -np.inf], 0)
 
+
     def calculate_bearing(self):
-        lat1 = np.radians(self.df["lat"][:-1])
-        lat2 = np.radians(self.df["lat"][1:])
-        diff_long = np.radians(self.df["lon"][1:] - self.df["lon"][:-1])
+        """
+        Calculate the compass bearing between consecutive points in the DataFrame.
+        """
+        lat1 = np.radians(self.df["lat"].shift(0))
+        lat2 = np.radians(self.df["lat"].shift(-1))
+        diff_long = np.radians(self.df["lon"].shift(-1) - self.df["lon"])
 
         x = np.sin(diff_long) * np.cos(lat2)
         y = np.cos(lat1) * np.sin(lat2) - (np.sin(lat1) * np.cos(lat2) * np.cos(diff_long))
@@ -50,7 +56,8 @@ class Course:
         initial_bearing = np.degrees(initial_bearing)
         compass_bearing = (initial_bearing + 360) % 360
 
-        self.df["bearing"] = compass_bearing  # Append NaN for the last row
+        self.df["bearing"] = compass_bearing
+        self.df["bearing"].fillna(0, inplace=True)  # Handle NaN for the last row
 
     def bearing_to_cardinal(self):
         directions = ['N', 'NNE', 'NE', 'ENE', 'E', 'ESE', 'SE', 'SSE', 'S', 'SSW', 'SW', 'WSW', 'W', 'WNW', 'NW', 'NNW']
@@ -58,25 +65,80 @@ class Course:
         self.df["cardinal"] = idx.apply(lambda x: directions[x % 16])
 
     def equal_segmentation(self, n):
-        self.df['segment'] = pd.cut(df['distance'], n, labels=False)
-        self.course_segments = self.df.groupby('segment').agg({'lat':'mean','lon':'mean','altitude':'min','gradient':'mean', 'altitude':'mean'})
-        self.course_segments.dropna()
+        """Divide the course into equal segments based on distance."""
+        self.df['segment'] = pd.cut(self.df['cumulative_distance'], bins=n, labels=False)+1
+        self.aggregate_segments()  # Call the aggregation method
 
     def slider_segmentation(self, slider_values):
-        #check if slider values are empty in the df then set to len(slider_values)
-        
+        """Segment the course based on slider values."""
         self.df['segment'] = len(slider_values)
         for i in range(1, len(slider_values)):
-            coures_length=self.df.distance.sum()
-            print("Slider value ", i, " | ", slider_values[i])
-            min_seg_dist = slider_values[i-1]/100 * coures_length
-            max_seg_dist = slider_values[i]/100 * coures_length
-            print("Full course length: ", self.df['cumulative_distance'].max())
-            print("Segment: ", i, " | min seg distance: ", min_seg_dist, " | max seg distance: ", max_seg_dist)
-            self.df.loc[(self.df['cumulative_distance'] >= min_seg_dist) &  (self.df['cumulative_distance'] < max_seg_dist), 'segment'] = i
-       
+            course_length = self.df.distance.sum()
+            min_seg_dist = slider_values[i - 1] / 100 * course_length
+            max_seg_dist = slider_values[i] / 100 * course_length
+            self.df.loc[
+                (self.df['cumulative_distance'] >= min_seg_dist) &
+                (self.df['cumulative_distance'] < max_seg_dist),
+                'segment'
+            ] = i
+        self.aggregate_segments()  # Call the aggregation method
 
+    def manual_segmentation(self, num_sliders, distance=100):
+        """
+        Perform manual segmentation using slider values.
 
+        Args:
+            num_sliders (int): Number of sliders for segmentation.
+            distance (float): Total distance of the course.
+
+        Returns:
+            list: Slider values representing segment boundaries.
+        """
+        slider_values = [0]
+        equal_distance = distance / num_sliders
+
+        for i in range(1, num_sliders):
+            min_value = slider_values[i - 1]
+            initial_value = min_value + equal_distance
+            slider_values.append(initial_value)
+
+        slider_values.append(distance)  # Ensure the last segment ends at the total distance
+
+        # Apply segmentation based on slider values
+        self.df['segment'] = len(slider_values) - 1
+        for i in range(1, len(slider_values)):
+            min_seg_dist = slider_values[i - 1]
+            max_seg_dist = slider_values[i]
+            self.df.loc[
+                (self.df['cumulative_distance'] >= min_seg_dist) &
+                (self.df['cumulative_distance'] < max_seg_dist),
+                'segment'
+            ] = i
+        self.aggregate_segments()  # Call the aggregation method
+
+        return slider_values
+
+    def aggregate_segments(self):
+        """Aggregate segment data to calculate summary statistics."""
+        self.course_segments = self.df.groupby('segment').agg({
+            'lat': 'mean',
+            'lon': 'mean',
+            'bearing': 'mean',
+            'altitude': ['mean', 'min', 'max'],
+            'gradient': 'mean',
+            'height_gain': 'sum',
+            'height_loss': 'sum',
+            'distance': 'sum'
+        }).reset_index()
+        #flatten multiindex columns
+        self.course_segments.columns = ['_'.join(col).strip() for col in self.course_segments.columns.values]
+        self.course_segments.rename(columns={'segment_': 'segment'}, inplace=True)
+        #Convert distance to km instead of m
+        self.course_segments['distance_sum'] = self.course_segments['distance_sum'] / 1000
+        self.course_segments['gradient_mean'] = self.course_segments['gradient_mean'] * 100
+        self.course_segments['gradient_mean'] = self.course_segments['gradient_mean'].round(2)
+        self.course_segments.drop(columns = ['lat_mean', 'lon_mean'], inplace=True)
+        self.course_segments.dropna(inplace=True)
 
     def smooth_data(self, df_col, window_size=5):
         return (
@@ -86,6 +148,71 @@ class Course:
             .fillna(method='bfill')  # Fill the start of the DataFrame
             .fillna(method='ffill')  # Fill the end of the DataFrame
         )
+
+    def auto_segmentation(self, max_clusters=10, gradient_weight=1.0, bearing_weight=1.0, smoothing_window=5):
+        """
+        Automatically segment the course into clusters based on gradient and bearing.
+
+        Args:
+            max_clusters (int): Maximum number of clusters to create.
+            gradient_weight (float): Weight for the gradient feature.
+            bearing_weight (float): Weight for the bearing feature.
+            smoothing_window (int): Window size for smoothing gradient and bearing data.
+        """
+        def normalize_bearing(bearing):
+            """Normalize bearing to handle circularity (e.g., 359 is close to 0)."""
+            return np.radians(bearing)
+
+        def compute_custom_distance(point_a, point_b):
+            """
+            Custom distance metric that considers gradient and bearing.
+            Args:
+                point_a: Tuple (gradient, bearing).
+                point_b: Tuple (gradient, bearing).
+            Returns:
+                float: Weighted distance between the two points.
+            """
+            grad_a, bear_a = point_a
+            grad_b, bear_b = point_b
+
+            # Normalize gradient difference
+            grad_diff = abs(grad_a - grad_b)
+
+            # Normalize bearing difference (handle circularity)
+            bear_diff = abs(np.arctan2(np.sin(bear_a - bear_b), np.cos(bear_a - bear_b)))
+
+            # Adjust weights based on gradient
+            if abs(grad_a) > 2 or abs(grad_b) > 2:  # High gradient scenario
+                grad_weight = gradient_weight * 1.5
+                bear_weight = bearing_weight * 0.5
+            else:  # Flat scenario
+                grad_weight = gradient_weight * 0.5
+                bear_weight = bearing_weight * 1.5
+
+            return grad_weight * grad_diff + bear_weight * bear_diff
+
+        # Smooth gradient and bearing columns
+        self.df["gradient_smoothed"] = self.smooth_data(self.df["gradient"], window_size=smoothing_window)
+        self.df["bearing_smoothed"] = self.smooth_data(self.df["bearing"], window_size=smoothing_window)
+
+        # Normalize bearing for clustering
+        self.df["bearing_normalized"] = normalize_bearing(self.df["bearing_smoothed"])
+        features = self.df[["gradient_smoothed", "bearing_normalized"]].to_numpy()
+
+        # Compute custom distance matrix
+        dist_matrix = squareform(pdist(features, metric=compute_custom_distance))
+
+        # Perform hierarchical clustering
+        clusterer = AgglomerativeClustering(
+            linkage="average",
+            n_clusters=None,
+            distance_threshold=None
+        )
+        clusterer.set_params(n_clusters=min(max_clusters, len(self.df)))
+        self.df["segment"] = clusterer.fit_predict(dist_matrix)
+
+        # Aggregate segments
+        self.aggregate_segments()
 
 
 class CourseSegmentation:
@@ -185,6 +312,7 @@ class CourseSegmentation:
         )
         self.labels = clusterer.fit_predict(dist_matrix)
         self.data['segment'] = self.labels
+        self.aggregate_segments()  # Call the aggregation method
         return self.labels
 
     def plot_segments(self, save_plots=False, show_plot=True,  file="CourseSegmentation"):

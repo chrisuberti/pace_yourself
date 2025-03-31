@@ -55,6 +55,7 @@ class Rider:
         elif rider_id:
             self.rider_id = rider_id
         
+
         #important block to populate critical power and WTank
 
         if rider_type and critical_power:
@@ -216,11 +217,11 @@ class WTankCalculator:
 
         # Base multipliers for power at different durations (relative to critical power)
         if self.rider_type == "time_trialist":
-            multipliers = {60: 1.4, 300: 1.2, 600: 1.1, 1200: 1.05, 1800: 1.02}
+            multipliers = {60: 1.4, 300: 1.2, 600: 1.1, 1200: 1.05, 1800: 1.02, 3600: 1.0}
         elif self.rider_type == "sprinter":
-            multipliers = {60: 1.8, 300: 1.4, 600: 1.2, 1200: 1.1, 1800: 1.05}
+            multipliers = {60: 1.8, 300: 1.4, 600: 1.2, 1200: 1.1, 1800: 1.05, 3600: 1.0}
         elif self.rider_type == "all_rounder":
-            multipliers = {60: 1.6, 300: 1.3, 600: 1.15, 1200: 1.08, 1800: 1.03}
+            multipliers = {60: 1.6, 300: 1.3, 600: 1.15, 1200: 1.08, 1800: 1.03, 3600: 1.0}
         else:
             raise ValueError("Invalid rider type. Choose from 'time_trialist', 'sprinter', or 'all_rounder'.")
 
@@ -230,6 +231,7 @@ class WTankCalculator:
 
     def _estimate_w_tank_from_profile(self):
         """Estimate W' based on rider type and critical power."""
+        _ = self._estimate_w_tank_from_curve() #do this so we populate the popt variable
         if self.rider_type == "time_trialist":
             return 10_000 + 0.5 * self.critical_power
         elif self.rider_type == "sprinter":
@@ -238,22 +240,37 @@ class WTankCalculator:
             return 15_000 + 0.6 * self.critical_power
         else:
             raise ValueError("Invalid rider type. Choose from 'time_trialist', 'sprinter', or 'all_rounder'.")
+        
+        
+        
 
     def _power_duration_model(self, t, CP, W_prime):
-        """Power-duration model: P(t) = CP + W'/t."""
-        return CP + W_prime / t
+        """
+        Modified power-duration model: P(t) = CP + W' / t
+        The parameter `k` adjusts the curve's shape and asymptote.
+        """
+        return CP + W_prime / (t)
 
     def _estimate_w_tank_from_curve(self):
-        """Estimate W' based on the power-duration curve."""
+        """Estimate W' based on the modified power-duration curve."""
         if not self.best_efforts:
             self._populate_best_efforts()  # Populate best efforts if not provided
 
         durations = np.array(list(self.best_efforts.keys()))
         powers = np.array(list(self.best_efforts.values()))
 
-        # Curve fitting to estimate CP and W'
-        popt, _ = curve_fit(self._power_duration_model, durations, powers, bounds=(0, np.inf))
-        estimated_cp, w_prime = popt
+        # Apply weights: prioritize durations >= 1200 seconds
+        weights = np.ones_like(durations)
+        weights[durations >= 1200] = 10  # Assign higher weight to longer durations
+
+        # Curve fitting with weights
+        popt, _ = curve_fit(
+            self._power_duration_model,
+            durations,
+            powers
+        )
+        self.popt = popt  # Store the fitted parameters (CP, W_prime
+        estimated_cp, w_prime= popt
 
         # Store critical power if not provided
         if self.critical_power is None:
@@ -280,25 +297,25 @@ class WTankCalculator:
         durations = np.array(list(self.best_efforts.keys()))
         powers = np.array(list(self.best_efforts.values()))
 
-        # Fit the curve
-        popt, _ = curve_fit(self._power_duration_model, durations, powers, bounds=(0, np.inf))
-        estimated_cp, w_prime = popt
+        # Unpack the fitted parameters
+        estimated_cp, w_prime = self.popt
 
-        # Generate a smooth curve
-        t_fit = np.linspace(min(durations), max(durations), 500)
-        p_fit = self._power_duration_model(t_fit, *popt)
+        # Generate a smooth curve with fewer points
+        t_fit = np.linspace(min(durations), max(durations), 200)  # Reduced from 500 to 200 points
+        p_fit = self._power_duration_model(t_fit, estimated_cp, w_prime)
 
-        # Plot
-        plt.figure(figsize=(8, 5))
-        plt.scatter(durations, powers, color='red', label='Best Efforts Data')
-        plt.plot(t_fit, p_fit, label=f'Fitted Curve\nCP={estimated_cp:.2f} W, W\'={w_prime:.2f} J')
-        plt.axvline(y=estimated_cp, color='gray', linestyle='--', label=f'W\'/CP = {w_prime / estimated_cp:.2f} s')
-        plt.xlabel('Duration (s)')
-        plt.ylabel('Power (W)')
-        plt.title('Power-Duration Curve')
-        plt.legend()
-        plt.grid()
-        plt.show()
+        # Create the plot with a smaller figure size
+        fig, ax = plt.subplots(figsize=(6, 4))  # Adjusted figure size
+        ax.scatter(durations, powers, color='red', label='Best Efforts Data')
+        ax.plot(t_fit, p_fit, label=f'Fitted Curve\nCP={estimated_cp:.2f} W, W\'={w_prime:.2f} J')
+        ax.axhline(y=estimated_cp, color='gray', linestyle='--', label=f'Asymptote (CP={estimated_cp:.2f} W)')
+        ax.text(max(durations) * 0.8, estimated_cp * 1.05, f'CP={estimated_cp:.2f} W', color='gray')
+        ax.set_xlabel('Duration (s)')
+        ax.set_ylabel('Power (W)')
+        ax.grid()
+        ax.legend()
+
+        return fig  # Return the figure object
 
 def calculate_critical_power(activities, durations):
     best_power = {duration: 0 for duration in durations}
@@ -329,7 +346,7 @@ def get_critical_power_profile(days=60):
         print('Starting critical power profile calculation')
         activities = get_activities(days)  # Retrieve activities from the past `days` days
         print('Activities:', activities)
-        durations = [15, 30, 60, 120, 300, 1200, 60*30]  # Durations in seconds (5s, 30s, 1min, 5min, 20min)
+        durations = [15, 30, 60, 120, 300, 1200, 60*30, 60*60]  # Durations in seconds (5s, 30s, 1min, 5min, 20min)
         critical_power = calculate_critical_power(activities, durations)
 
         print("Critical Power Profile:")
@@ -343,7 +360,40 @@ def get_critical_power_profile(days=60):
         print(traceback.format_exc())
         return None
 
+def calculate_w_prime_recovery(
+        W_prime_max, 
+        W_prime_current, 
+        CP, P_recovery, 
+        recovery_time, 
+        tau_base=2287.2, 
+        tau_exponent=-0.688):
+    """
+    Calculate the W' (anaerobic work capacity) recovery during a recovery period below CP.
+    ref: https://journals.humankinetics.com/view/journals/ijspp/13/6/article-p724.xml
 
+    :param W_prime_max: Maximum W' (anaerobic capacity) in joules.
+    :param W_prime_current: Current W' value in joules.
+    :param CP: Critical power in watts.
+    :param P_recovery: Power during recovery in watts.
+    :param recovery_time: Duration of recovery in seconds.
+    :param tau_base: Base coefficient for tau calculation (default from Skiba model).
+    :param tau_exponent: Exponent for tau calculation (default from Skiba model).
+    :return: Updated W' after the recovery period.
+    """
+    # Calculate Deficit Below Critical Power (DCP)
+    DCP = CP - P_recovery
+    if DCP <= 0:
+        # No recovery if power is at or above CP
+        return W_prime_current
+
+    # Calculate the time constant of recovery (tau)
+    tau_W_prime = tau_base * (DCP ** tau_exponent)
+
+    # Calculate the recovered W' using the exponential recovery formula
+    W_prime_recovered = W_prime_max - (W_prime_max - W_prime_current) * np.exp(-recovery_time / tau_W_prime)
+
+    # Ensure W' does not exceed the maximum capacity
+    return min(W_prime_recovered, W_prime_max)
 
 
 # Example usage

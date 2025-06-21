@@ -27,6 +27,25 @@ def calculate_speed_and_plot(Power, rho=1.225, CdA=0.3, Crr=0.005, mass=75,
         dict: A dictionary containing the x-intercept (speed in m/s), 
               speed in mph, and optionally the plot figure.
     """
+    # Validate gradient input - prevent common format errors
+    if abs(gradient) > 0.5:  # No real-world gradient exceeds 50%
+        if abs(gradient) > 1.0:
+            # Likely percentage format error (e.g., 5.0 instead of 0.05)
+            suggested_gradient = gradient / 100.0
+            raise ValueError(
+                f"Invalid gradient: {gradient:.2f}. "
+                f"Real-world gradients are decimals (0.0-0.3). "
+                f"Did you mean {suggested_gradient:.3f} instead of {gradient:.2f}? "
+                f"(Use 0.05 for 5%, not 5.0)"
+            )
+        else:
+            # Extremely steep but technically possible
+            import warnings
+            warnings.warn(
+                f"Extremely steep gradient: {gradient:.2f} ({gradient*100:.0f}%). "
+                f"Are you sure this is correct? Most climbs are <25%."
+            )
+    
     # Constants
     m = mass
     g = 9.81

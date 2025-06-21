@@ -1,3 +1,0 @@
-- finished / ready to use files
-- auth.py - simply get the oauth and refresh the tokens for users
-- strava_calls.py - used to call specific strava end points

@@ -132,10 +132,9 @@ class Course:
         }).reset_index()
         #flatten multiindex columns
         self.course_segments.columns = ['_'.join(col).strip() for col in self.course_segments.columns.values]
-        self.course_segments.rename(columns={'segment_': 'segment'}, inplace=True)
-        #Convert distance to km instead of m
+        self.course_segments.rename(columns={'segment_': 'segment'}, inplace=True)        #Convert distance to km instead of m
         self.course_segments['distance_sum'] = self.course_segments['distance_sum'] / 1000
-        self.course_segments['gradient_mean'] = self.course_segments['gradient_mean'] * 100
+        # Gradient is already calculated as percentage in process_segment(), no need to multiply by 100 again
         self.course_segments['gradient_mean'] = self.course_segments['gradient_mean'].round(2)
         self.course_segments.drop(columns = ['lat_mean', 'lon_mean'], inplace=True)
         self.course_segments.dropna(inplace=True)

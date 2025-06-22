@@ -109,21 +109,21 @@ class CourseOptimizer:
                 'speed': speed,
                 'time': time,
                 'power': power,
-                'w_remaining': w_remaining,
-                'total_energy_used': total_energy_used
+                'w_remaining': w_remaining,                'total_energy_used': total_energy_used
             })
         
         return pd.DataFrame(results), total_time, w_remaining, total_energy_used
     
-    def optimize_constant_power(self, course_segments: pd.DataFrame) -> Tuple[float, float, pd.DataFrame]:
+    def optimize_constant_power(self, course_segments: pd.DataFrame, target_w_utilization: float = 0.85) -> Tuple[float, float, pd.DataFrame]:
         """
-        Find the optimal constant power to efficiently use the rider's energy budget.
+        Find the optimal constant power that strategically depletes the W' tank.
         
-        This optimization seeks to find the power that minimizes total time while
-        efficiently utilizing the rider's available energy (CP × time + W').
+        This optimization finds a power level that minimizes time while targeting
+        a specific W' utilization level (default 85% depletion for aggressive pacing).
         
         Args:
             course_segments: DataFrame containing course segment data
+            target_w_utilization: Target W' utilization (0.0-1.0, default 0.85 = 85% depletion)
         
         Returns:
             Tuple containing:
@@ -131,52 +131,119 @@ class CourseOptimizer:
             - Total course time at optimal power (seconds)
             - DataFrame with segment-by-segment results at optimal power
         """
+        
         def objective(power: float) -> float:
-            """Objective function to minimize: time + penalty for inefficient energy use"""
+            """Objective function: minimize time while targeting W' utilization"""
             try:
-                _, total_time, _, total_energy_used = self.simulate_course_time(power, course_segments)
+                _, total_time, w_remaining, _ = self.simulate_course_time(power, course_segments)
                 
-                # Calculate theoretical energy budget
-                energy_budget = self.critical_power * total_time + self.w_prime
+                # If simulation failed (W' depleted), return very high penalty based on power level
+                if total_time == float('inf') or total_time > 1e6:
+                    # Penalty increases with power level to guide optimization away from impossible powers
+                    power_penalty = (power - self.critical_power) ** 2
+                    return 1e6 + power_penalty
                 
-                # Penalize deviation from efficient energy use
-                energy_penalty = abs(energy_budget - total_energy_used) * 0.001  # Scale penalty
+                # Ensure we have valid numbers
+                if not np.isfinite(total_time) or not np.isfinite(w_remaining):
+                    return 1e6 + (power - self.critical_power) ** 2
                 
-                # Return total time plus penalty (minimize time while using energy efficiently)
-                return total_time + energy_penalty
+                # Calculate W' utilization
+                w_used = self.w_prime - w_remaining
+                w_utilization = w_used / self.w_prime
+                
+                # Strong penalty for not using enough W' (undertrained) or using too much (unsustainable)
+                w_penalty = abs(w_utilization - target_w_utilization) * total_time * 0.1
+                
+                # Heavily penalize finishing with too much W' remaining (inefficient)
+                if w_utilization < target_w_utilization * 0.7:  # Less than 70% of target
+                    w_penalty *= 5  # Strong penalty for conservative pacing
+                
+                # Return time plus W' utilization penalty
+                return total_time + w_penalty
                 
             except Exception as e:
                 print(f"Warning: Optimization objective failed at power {power}: {e}")
-                return float('inf')  # Return high penalty for failed calculations
-        
-        # Set optimization bounds around critical power
-        lower_bound = max(50, self.critical_power - 100)  # Don't go too low
-        upper_bound = self.critical_power * 3  # Allow significant overpowering
+                return 1e6 + (power - self.critical_power) ** 2        
+        # Set more conservative optimization bounds to avoid numerical issues
+        lower_bound = max(self.critical_power * 0.9, 150)  # More conservative lower bound
+        upper_bound = min(self.critical_power * 2.0, 500)  # More conservative upper bound
         bounds = [(lower_bound, upper_bound)]
         
+        # Start optimization from a reasonable power level
+        initial_power = min(self.critical_power * 1.2, upper_bound)
+        
         try:
-            # Run optimization
-            result = minimize(
-                lambda p: objective(p[0]), 
-                x0=[self.critical_power], 
-                bounds=bounds, 
-                method='L-BFGS-B'
-            )
+            # Run optimization with multiple starting points to avoid local minima
+            best_result = None
+            best_objective = float('inf')
             
-            if result.success:
-                optimal_power = result.x[0]
+            # Try multiple starting points within reasonable range
+            start_powers = [
+                max(self.critical_power * 1.05, lower_bound),  # Just above CP
+                min(self.critical_power * 1.2, upper_bound),   # Moderate
+                min(self.critical_power * 1.4, upper_bound),   # Aggressive
+            ]
+            
+            for start_power in start_powers:
+                if lower_bound <= start_power <= upper_bound:
+                    result = minimize(
+                        lambda p: objective(p[0]), 
+                        x0=[start_power], 
+                        bounds=bounds, 
+                        method='L-BFGS-B',
+                        options={'ftol': 1e-6, 'gtol': 1e-6, 'maxiter': 100}
+                    )
+                    
+                    if result.success and result.fun < best_objective and np.isfinite(result.fun):
+                        best_result = result
+                        best_objective = result.fun            
+            if best_result and best_result.success and np.isfinite(best_result.fun):
+                optimal_power = best_result.x[0]
+                print(f"Optimization converged to {optimal_power:.0f}W (target W' utilization: {target_w_utilization*100:.0f}%)")
             else:
-                print(f"Optimization failed: {result.message}")
-                optimal_power = self.critical_power  # Fallback to critical power
+                print(f"Optimization failed, using intelligent fallback strategy")
+                # Intelligent fallback: find highest sustainable power
+                test_powers = np.linspace(lower_bound, upper_bound, 20)
+                best_power = lower_bound
+                best_score = float('inf')
                 
+                for test_power in test_powers:
+                    score = objective(test_power)
+                    if score < best_score and np.isfinite(score):
+                        best_power = test_power
+                        best_score = score
+                
+                optimal_power = best_power
+                print(f"Fallback found power: {optimal_power:.0f}W")                
         except Exception as e:
             print(f"Optimization error: {e}")
-            optimal_power = self.critical_power  # Fallback to critical power
+            # Conservative fallback
+            optimal_power = min(self.critical_power * 1.1, upper_bound)
+        
+        # Ensure optimal_power is within reasonable bounds
+        optimal_power = max(lower_bound, min(optimal_power, upper_bound))
         
         # Get detailed results at optimal power
         df_results, optimal_time, w_remaining, total_energy = self.simulate_course_time(
             optimal_power, course_segments
         )
+        
+        # Handle infinite time case
+        if optimal_time == float('inf') or not np.isfinite(optimal_time):
+            print(f"Warning: Optimal power {optimal_power:.0f}W results in course failure")
+            # Try a more conservative power
+            conservative_power = self.critical_power * 1.05
+            df_results, optimal_time, w_remaining, total_energy = self.simulate_course_time(
+                conservative_power, course_segments
+            )
+            if optimal_time != float('inf') and np.isfinite(optimal_time):
+                optimal_power = conservative_power
+                print(f"Using conservative fallback: {optimal_power:.0f}W")
+        
+        # Report W' utilization achieved
+        w_used = self.w_prime - w_remaining
+        w_utilization_achieved = w_used / self.w_prime
+        print(f"Achieved W' utilization: {w_utilization_achieved*100:.1f}% (target: {target_w_utilization*100:.0f}%)")
         
         return optimal_power, optimal_time, df_results
     
@@ -241,14 +308,27 @@ def create_course_segments_from_course(course) -> pd.DataFrame:
         raise ValueError("Course must have aggregated segments. Run segmentation first.")
     
     segments = course.course_segments.copy()
+      # Debug: Check gradient values to determine if they're already decimals or percentages
+    sample_gradient = segments['gradient_mean'].iloc[0] if len(segments) > 0 else 0
+    gradient_is_percentage = abs(sample_gradient) > 1.0  # If >1, likely stored as percentage
     
     # Ensure required columns exist with proper names
     optimization_segments = pd.DataFrame({
         'distance': segments['distance_sum'] * 1000,  # Convert km to meters
-        'gradient': segments['gradient_mean'] / 100,  # Convert percentage to decimal
+        'gradient': segments['gradient_mean'] / 100,  # Always convert percentage to decimal for physics calculations
         'altitude': segments.get('altitude_mean', 0),  # Use mean altitude if available
         'wind': 0  # Default to no wind - can be enhanced later
     })
+    
+    # Validate gradients are reasonable (between -0.3 and 0.3 for -30% to 30%)
+    invalid_gradients = optimization_segments[(optimization_segments['gradient'].abs() > 0.5)]
+    if len(invalid_gradients) > 0:
+        import warnings
+        warnings.warn(
+            f"Found {len(invalid_gradients)} segments with extreme gradients. "
+            f"Max gradient: {optimization_segments['gradient'].max():.3f} "
+            f"({optimization_segments['gradient'].max()*100:.1f}%)"
+        )
     
     return optimization_segments
 

@@ -1,5 +1,11 @@
 .streamlit/secrets.toml
 
+# Development directories (if recreated)
+.copilot/
+docs/
+notes/
+*.ps1
+
 # Byte-compiled / optimized / DLL files
 __pycache__/
 *.py[cod]

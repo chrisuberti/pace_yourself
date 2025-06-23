@@ -7,7 +7,7 @@ This script verifies that all Phase 1 deliverables are working correctly.
 
 import sys
 import os
-sys.path.append('.')
+sys.path.append(os.path.join(os.path.dirname(__file__), '..', '..'))
 
 def test_imports():
     """Test that all new modules can be imported."""

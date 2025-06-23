@@ -10,7 +10,7 @@ import sys
 import os
 
 # Add the app directory to the Python module search path
-sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), 'app')))
+sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..', '..', 'app')))
 
 from app.optimization import CourseOptimizer
 

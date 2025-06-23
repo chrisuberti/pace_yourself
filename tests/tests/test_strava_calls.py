@@ -1,6 +1,9 @@
 import unittest
 from unittest.mock import patch, MagicMock
-from strava_calls import fetch_segment_data, get_activities, get_power_stream
+import sys
+import os
+sys.path.append(os.path.join(os.path.dirname(__file__), '..', '..'))
+from app.strava_calls import fetch_segment_data, get_activities, get_power_stream
 
 class TestStravaCalls(unittest.TestCase):
 

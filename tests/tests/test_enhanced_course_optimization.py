@@ -5,7 +5,7 @@ that leverage the existing plot_cumulative_distance_vs_altitude pattern
 
 import sys
 import os
-sys.path.append('.')
+sys.path.append(os.path.join(os.path.dirname(__file__), '..', '..'))
 
 import pandas as pd
 import numpy as np

@@ -6,6 +6,9 @@ and identify the potential 100x multiplication error.
 
 import numpy as np
 import pandas as pd
+import sys
+import os
+sys.path.append(os.path.join(os.path.dirname(__file__), '..', '..'))
 from app.cycling_physics import calculate_speed_and_plot
 
 def test_gradient_power_relationship():

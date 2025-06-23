@@ -5,6 +5,9 @@ Test the gradient conversion fix
 
 import pandas as pd
 import numpy as np
+import sys
+import os
+sys.path.append(os.path.join(os.path.dirname(__file__), '..', '..'))
 from app.course import Course
 from app.optimization import create_course_segments_from_course
 

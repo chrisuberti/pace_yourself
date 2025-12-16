@@ -1,8 +1,8 @@
 """
-Course Optimization Page
+Course Optimization Page - Enhanced Version
 
-This page demonstrates the new optimization capabilities integrated from 
-the notebook functions. Users can analyze pacing strategies and power optimization.
+Streamlined optimization workflow that always performs coarse → granular optimization
+with clean visualization focused on detailed results.
 """
 
 import streamlit as st
@@ -10,346 +10,384 @@ import pandas as pd
 import numpy as np
 import os
 import sys
-import plotly.graph_objects as go
-import plotly.express as px
-from plotly.subplots import make_subplots
 
 # Add the app directory to the Python module search path
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
 
 from app.course import Course
 from app.optimization import CourseOptimizer, create_course_segments_from_course
-from app.visualizations import (
-    create_map, 
-    plot_cumulative_distance_vs_altitude, 
-    plot_course_profile_with_overlays,
-    plot_power_strategy_summary
+from app.course_management import CourseManager
+from app.database import get_course_db
+from app.visualizations_granular import (
+    create_granular_optimization_chart,
+    display_performance_metrics,
+    create_segment_summary_table
 )
 
+# Initialize course manager
+if 'course_manager' not in st.session_state:
+    st.session_state.course_manager = CourseManager()
 
-def plot_power_comparison_table(power_results):
-    """Create a simple comparison table for different power levels."""
-    comparison_data = []
-    for power, data in power_results.items():
-        if data['time'] != float('inf'):
-            avg_speed = (data['total_distance'] / data['time']) * 3.6 if 'total_distance' in data else 'N/A'
-            comparison_data.append({
-                'Target Power (W)': power,
-                'Time (min)': f"{data['time'] / 60:.1f}",
-                'Avg Speed (km/h)': f"{avg_speed:.1f}" if avg_speed != 'N/A' else 'N/A',
-                'W\' Remaining (kJ)': f"{data['w_remaining'] / 1000:.1f}",
-                'Status': '✅ Success'
-            })
-        else:
-            comparison_data.append({
-                'Target Power (W)': power,
-                'Time (min)': '∞ (Failed)',
-                'Avg Speed (km/h)': 'N/A',
-                'W\' Remaining (kJ)': 'Depleted',
-                'Status': '❌ Failed'
-            })
-    return pd.DataFrame(comparison_data)
+st.title("🚀 Course Optimization")
+st.write("Enhanced optimization with always-on granular simulation for maximum accuracy")
 
+# Course Selection Section
+st.header("🏁 Course Selection")
 
-# Page title and description
-st.title("🚴‍♂️ Course Optimization & Pacing Strategy")
-st.write("""
-Enhanced course optimization using your proven visualization methods.
-Analyze optimal pacing strategies with intuitive course profile visualizations.
-""")
-
-# Initialize session state
-if 'optimization_course' not in st.session_state:
-    st.session_state.optimization_course = None
-if 'optimization_results' not in st.session_state:
-    st.session_state.optimization_results = None
-
-# Sidebar for course selection and rider parameters
-st.sidebar.header("Course & Rider Setup")
-
-# Course loading options
-course_source = st.sidebar.radio(
-    "Course Data Source",
-    ["Load from Files", "Use Current Session", "Create Sample Course"]
-)
-
-course = None
-
-if course_source == "Load from Files":
-    route_path = os.getenv('ROUTE_PATH', 'data/sample_routes')
-    if os.path.exists(route_path):
-        files = [f for f in os.listdir(route_path) if f.endswith('.csv')]
-        if files:
-            selected_file = st.sidebar.selectbox("Select Course File", files)
-            if st.sidebar.button("Load Course"):
-                course_data = pd.read_csv(os.path.join(route_path, selected_file))
-                course = Course(course_data)
-                st.session_state.optimization_course = course
-                st.sidebar.success(f"Loaded {selected_file}")
-
-elif course_source == "Use Current Session":
-    if 'course' in st.session_state:
-        course = st.session_state.course
-        st.session_state.optimization_course = course
-        st.sidebar.success("Using session course")
-    else:
-        st.sidebar.warning("No course in current session")
-
-elif course_source == "Create Sample Course":
-    if st.sidebar.button("Generate Sample Course"):
-        # Create a sample hilly course
-        sample_data = pd.DataFrame({
-            'lat': [47.6 + i*0.001 for i in range(50)],
-            'lon': [-122.3 - i*0.0005 for i in range(50)],
-            'altitude': [100 + 50*np.sin(i/5) + 20*np.sin(i/2) for i in range(50)]
-        })
-        course = Course(sample_data)
-        st.session_state.optimization_course = course
-        st.sidebar.success("Generated sample course")
-
-# Use course from session state if available
-if st.session_state.optimization_course:
-    course = st.session_state.optimization_course
-
-# Rider parameters
-st.sidebar.subheader("Rider Parameters")
-critical_power = st.sidebar.number_input("Critical Power (W)", min_value=100, max_value=500, value=300, step=10)
-w_prime = st.sidebar.number_input("W' Anaerobic Capacity (kJ)", min_value=10, max_value=50, value=25, step=1) * 1000
-
-# Segmentation options
-if course:
-    st.sidebar.subheader("Course Segmentation")
-    segmentation_method = st.sidebar.selectbox(
-        "Segmentation Method",
-        ["Equal Distance", "Auto Clustering", "Use Existing"]
-    )
+# Check if we have a course from the segmentation page
+if 'course' in st.session_state and st.session_state.course:
+    current_course = st.session_state.course
+    course_name = getattr(st.session_state, 'current_course_name', 'Current Course')
     
-    if segmentation_method == "Equal Distance":
-        num_segments = st.sidebar.slider("Number of Segments", 3, 15, 8)
-        if st.sidebar.button("Apply Segmentation"):
-            course.equal_segmentation(num_segments)
-            st.sidebar.success(f"Created {num_segments} equal segments")
+    st.success(f"✅ Course loaded: {course_name}")
     
-    elif segmentation_method == "Auto Clustering":
-        max_clusters = st.sidebar.slider("Max Clusters", 3, 15, 8)
-        if st.sidebar.button("Apply Auto Segmentation"):
-            course.auto_segmentation(max_clusters=max_clusters)
-            st.sidebar.success("Applied auto clustering")
-
-# Main content
-if course and hasattr(course, 'course_segments'):
-      # Course overview
-    st.header("Course Overview")
-    c1,c2,c3 = st.columns(3)
-
-    avg_gradient = course.course_segments['gradient_mean'].mean()
-    total_distance = course.course_segments['distance_sum'].sum()
-    total_elevation = course.course_segments['height_gain_sum'].sum()
-    # Auto-detect if gradient is stored as percentage or decimal
-    gradient_is_percentage = abs(avg_gradient) > 1.0 if not pd.isna(avg_gradient) else True
-    gradient_display = avg_gradient if gradient_is_percentage else avg_gradient * 100
-    with c1:
-        st.metric("Total Distance", f"{total_distance:.1f} km")
-    with c2:
-        st.metric("Total Elevation Gain", f"{total_elevation:.0f} m")
-    with c3:
-        st.metric("Average Gradient", f"{gradient_display:.1f}%")
-    
-    
-
-    # Course map
-    with st.expander("Course Map", expanded=True):
-            st.write(course.df)
-    if 'lat' in course.course_segments.columns:
-        st.write("Course Segments Map")
-        map_deck = create_map(course.df, color='segment')
-        st.pydeck_chart(map_deck)
-    
-    # Prepare optimization data
-    optimization_segments = create_course_segments_from_course(course)
-    optimizer = CourseOptimizer(critical_power, w_prime)
-
-
-    # Power comparison
-    st.subheader("Power Level Comparison")
-    
-    # Power range selection
-    col1, col2, col3 = st.columns(3)
-    with col1:
-        min_power = st.number_input("Min Power (W)", min_value=100, max_value=critical_power-50, value=critical_power-100)
-    with col2:
-        max_power = st.number_input("Max Power (W)", min_value=critical_power, max_value=600, value=critical_power+100)
-    with col3:
-        power_step = st.number_input("Power Step (W)", min_value=10, max_value=50, value=25)
-    
-    if st.button("Run Power Comparison"):
-        with st.spinner("Analyzing different power levels..."):
-            power_results = {}
-            test_powers = range(min_power, max_power + 1, power_step)
-            
-            for power in test_powers:
-                results, time, w_remaining, energy_used = optimizer.simulate_course_time(
-                    power, optimization_segments
-                )
-                
-                power_results[power] = {
-                    'results': results,
-                    'time': time,
-                    'w_remaining': w_remaining,
-                    'energy_used': energy_used
-                }
-            
-            st.session_state.power_comparison = power_results
-              # Display results table
-            comparison_data = []
-            for power, data in power_results.items():
-                if data['time'] != float('inf'):
-                    avg_speed = (optimization_segments['distance'].sum() / data['time']) * 3.6
-                    comparison_data.append({
-                        'Target Power (W)': power,
-                        'Time (min)': data['time'] / 60,
-                        'Avg Speed (km/h)': avg_speed,
-                        'W\' Remaining (kJ)': data['w_remaining'] / 1000,
-                        'Energy Used (kJ)': data['energy_used'] / 1000,
-                        'Status': '✅ Success'
-                    })
-                else:
-                    comparison_data.append({
-                        'Target Power (W)': power,
-                        'Time (min)': '∞ (Failed)',
-                        'Avg Speed (km/h)': 'N/A',
-                        'W\' Remaining (kJ)': 'Depleted',
-                        'Energy Used (kJ)': 'N/A',
-                        'Status': '❌ Failed'
-                    })
-              # Display comparison table
-            comparison_df = plot_power_comparison_table(power_results)
-            st.dataframe(comparison_df, use_container_width=True)
-            
-            # Store successful results for visualization
-            successful_results = {p: d for p, d in power_results.items() if d['time'] != float('inf')}
-            if successful_results:
-                st.success(f"✅ {len(successful_results)} power levels completed successfully")
+    # Show course metrics
+    if hasattr(current_course, 'df') and not current_course.df.empty:
+        col1, col2, col3, col4, col5 = st.columns(5)
+        
+        with col1:
+            total_distance = current_course.df['cumulative_distance'].iloc[-1] / 1000
+            st.metric("Distance", f"{total_distance:.1f} km")
+        
+        with col2:
+            elevation_gain = current_course.df['height_gain'].sum()
+            st.metric("Elevation Gain", f"{elevation_gain:.0f} m")
+        
+        with col3:
+            if hasattr(current_course, 'course_segments'):
+                st.metric("Segments", len(current_course.course_segments))
             else:
-                st.warning("❌ All power levels failed - try lower power values")
+                st.metric("Segments", "Not segmented")
+        
+        with col4:
+            avg_gradient = current_course.df['gradient'].mean()
+            st.metric("Avg Gradient", f"{avg_gradient:.1f}%")
+            
+        with col5:
+            gps_points = len(current_course.df) if hasattr(current_course, 'df') else 0
+            st.metric("GPS Points", f"{gps_points:,}")
+            
+else:
+    # No course loaded - show course selection from database
+    st.info("No course currently loaded. Please select a course:")
     
-    # Optimization
-    st.subheader("Optimal Power Strategy")
+    available_courses = st.session_state.course_manager.list_available_courses()
     
-    if st.button("Find Optimal Power"):
-        with st.spinner("Optimizing power strategy..."):
+    if available_courses:
+        # Course selection interface
+        def format_course_display(course):
+            """Format course for display"""
+            name = course['course_name']
+            strava_id = course.get('strava_segment_id')
+            
+            if strava_id:
+                if name.startswith('Strava Segment '):
+                    display_name = f"Strava Segment - {strava_id}"
+                else:
+                    display_name = f"{name} - {strava_id}"
+            else:
+                display_name = name
+            
+            return display_name
+        
+        selected_course = st.selectbox(
+            "Select a course to optimize:",
+            available_courses,
+            format_func=format_course_display
+        )
+        
+        if st.button("🔄 Load Selected Course"):
             try:
-                analysis = optimizer.analyze_pacing_strategy(optimization_segments)
-                st.session_state.optimization_results = analysis
-                # Add this right after: analysis = optimizer.analyze_pacing_strategy(optimization_segments)
-
-                # Add this right after: analysis = optimizer.analyze_pacing_strategy(optimization_segments)
-
-                # Quick debug inspection
-                st.write("### 🔍 Analysis Debug Information")
-                st.write("**Segment Breakdown Preview:**")
-                if 'segment_breakdown' in analysis:
-                    st.dataframe(analysis['segment_breakdown'].head(3))
-
-                with st.expander("📊 Complete Analysis Object", expanded=False):
-                    st.json(analysis)
-                # Display key results
-                col1, col2, col3, col4 = st.columns(4)
-                with col1:
-                    st.metric("Optimal Power", f"{analysis['optimal_power']:.0f} W")
-                with col2:
-                    st.metric("Total Time", f"{analysis['total_time_minutes']:.1f} min")
-                with col3:
-                    st.metric("Average Speed", f"{analysis['average_speed_kmh']:.1f} km/h")
-                with col4:
-                    st.metric("W' Utilization", f"{analysis['w_prime_utilization_percent']:.1f}%")
-                
-                # Performance metrics
-                st.subheader("Performance Metrics")
-                metrics_col1, metrics_col2 = st.columns(2)
-                
-                with metrics_col1:
-                    st.write("**Power Analysis**")
-                    st.write(f"Power-to-Weight: {analysis['performance_metrics']['power_to_weight']:.1f} W/kg")
-                    st.write(f"Intensity Factor: {analysis['performance_metrics']['intensity_factor']:.2f}")
-                    st.write(f"Normalized Power: {analysis['performance_metrics']['normalized_power']:.0f} W")
-                
-                with metrics_col2:
-                    st.write("**Training Load**")
-                    st.write(f"Estimated TSS: {analysis['performance_metrics']['tss_estimate']:.0f}")
-                    st.write(f"Final W' Remaining: {analysis['final_w_remaining']/1000:.1f} kJ")
-                    st.write(f"Total Distance: {analysis['total_distance_km']:.2f} km")
-                  # Critical segments
-                
-                # Enhanced Course Profile with Power/Speed Overlays
-                st.subheader("Course Profile with Power & Speed Strategy")
-                profile_fig = plot_course_profile_with_overlays(
-                    course.df, 
-                    optimization_results=analysis,
-                    color='segment',
-                    overlays=['power', 'speed'],
-                    title="Course Elevation Profile"
+                course_obj = st.session_state.course_manager.load_course_for_optimization(
+                    selected_course['course_id']
                 )
-                st.plotly_chart(profile_fig, use_container_width=True)
                 
-                # Power Strategy Summary
-                st.subheader("Power Strategy Analysis")
-                strategy_fig = plot_power_strategy_summary(analysis, course.course_segments)
-                st.plotly_chart(strategy_fig, use_container_width=True)
-                
+                if course_obj:
+                    st.session_state.course = course_obj
+                    st.session_state.current_course_id = selected_course['course_id']
+                    st.session_state.current_course_name = selected_course['course_name']
+                    st.success(f"✅ Loaded: {selected_course['course_name']}")
+                    st.rerun()
+                else:
+                    st.error("Failed to load course")
             except Exception as e:
-                st.error(f"Optimization failed: {e}")
+                st.error(f"Error loading course: {str(e)}")
+    else:
+        st.warning("No courses found in database.")
+        if st.button("📁 Go to Course Import"):
+            st.switch_page("pages/01_Segment_Data_and_Course_Segmentation.py")
+
+# Optimization section - only show if we have a course
+if 'course' in st.session_state and st.session_state.course:
+    course = st.session_state.course
     
-    # Display optimization results if available
-    if st.session_state.optimization_results:
-        analysis = st.session_state.optimization_results
+    # Ensure course is segmented
+    if not hasattr(course, 'course_segments') or course.course_segments.empty:
+        st.warning("⚠️ Course needs to be segmented first")
         
-        # Show course profile colored by segments (your existing visualization!)
-        st.subheader("Course Segmentation Overview")
-        course_profile_fig = plot_cumulative_distance_vs_altitude(course.df, color='segment')
-        st.plotly_chart(course_profile_fig, use_container_width=True)
-        
-        st.subheader("Power Strategy Breakdown")
-        segment_breakdown = analysis['segment_breakdown']
-        optimal_power = analysis['optimal_power']
-        
-        # Format segment data for display with RECOMMENDED POWER
-        display_segments = segment_breakdown.copy()
-        display_segments['speed_kmh'] = display_segments['speed'] * 3.6
-        display_segments['gradient_percent'] = display_segments['gradient'] * 100
-        display_segments['distance_km'] = display_segments['length'] / 1000
-        display_segments['recommended_power'] = optimal_power  # Add recommended power column
-        
-        display_cols = ['segment', 'distance_km', 'gradient_percent', 'recommended_power', 'speed_kmh', 'time', 'w_remaining']
-        display_segments = display_segments[display_cols]
-        display_segments.columns = ['Segment', 'Distance (km)', 'Gradient (%)', 'Target Power (W)', 'Speed (km/h)', 'Time (s)', 'W\' Remaining (J)']
-        
-        st.dataframe(display_segments, use_container_width=True)
-        
-        # Power strategy summary
-        st.info(f"🎯 **Power Strategy**: Maintain {optimal_power:.0f}W throughout the entire course for optimal time while preserving energy reserves.")
+        col1, col2 = st.columns(2)
+        with col1:
+            if st.button("🔧 Quick Auto-Segmentation"):
+                course.auto_segmentation(max_clusters=8)
+                st.success("✅ Applied auto-clustering")
+                st.rerun()
+        with col2:
+            if st.button("📁 Go to Segmentation Page"):
+                st.switch_page("pages/01_Segment_Data_and_Course_Segmentation.py")
+    
+    else:
+        # Convert course segments to optimization format
+        try:
+            optimization_segments = create_course_segments_from_course(course)
+            
+            # Course overview metrics
+            st.header("📊 Course Overview")
+            col1, col2, col3, col4 = st.columns(4)
+            
+            total_distance = optimization_segments['distance'].sum() / 1000
+            avg_gradient = optimization_segments['gradient'].mean() * 100
+            max_gradient = optimization_segments['gradient'].max() * 100
+            num_segments = len(optimization_segments)
+            
+            with col1:
+                st.metric("Distance", f"{total_distance:.1f} km")
+            with col2:
+                st.metric("Segments", f"{num_segments}")
+            with col3:
+                st.metric("Avg Gradient", f"{avg_gradient:.1f}%")
+            with col4:
+                st.metric("Max Gradient", f"{max_gradient:.1f}%")
+
+            # Optimization Settings
+            st.header("⚙️ Optimization Settings")
+            
+            col1, col2 = st.columns(2)
+            
+            with col1:
+                # Rider Profile
+                st.subheader("🏋️ Rider Profile")
+                critical_power = st.number_input(
+                    "Critical Power (W)",
+                    min_value=150,
+                    max_value=500,
+                    value=300,
+                    step=10,
+                    help="Your sustainable power output for ~1 hour"
+                )
+                
+                w_prime = st.number_input(
+                    "W' (Anaerobic Capacity)",
+                    min_value=10000,
+                    max_value=50000,
+                    value=25000,
+                    step=1000,
+                    format="%d",
+                    help="Your anaerobic energy reserve in Joules"
+                )
+                
+            with col2:
+                # Optimization Parameters
+                st.subheader("🎯 Optimization Parameters")
+                
+                optimization_type = st.selectbox(
+                    "Optimization Strategy",
+                    ["Constant Power", "Variable Pacing"],
+                    help="Constant Power: Single power target | Variable Pacing: Terrain-adaptive strategy"
+                )
+                
+                target_w_util = st.slider(
+                    "Target W' Utilization (%)",
+                    min_value=50,
+                    max_value=95,
+                    value=85,
+                    step=5,
+                    help="How much anaerobic capacity to target (higher = more aggressive)"
+                ) / 100
+
+            # Initialize optimizer
+            optimizer = CourseOptimizer(critical_power=critical_power, w_prime=w_prime)
+            
+            st.info("ℹ️ **Enhanced Mode Always Active**: Uses segment order preservation and high-resolution simulation (5000+ points)")
+
+            # Optimization execution
+            if optimization_type == "Constant Power":
+                st.subheader("🔄 Constant Power Optimization")
+                
+                if st.button("🚀 Optimize Constant Power", type="primary"):
+                    with st.spinner("Running two-stage optimization..."):
+                        try:
+                            # Always enable enhanced segmentation
+                            if hasattr(course, 'enable_enhanced_segmentation'):
+                                course.enable_enhanced_segmentation()
+                            
+                            # Stage 1: Coarse segment optimization (for strategy)
+                            with st.spinner("🎯 Stage 1: Determining optimal power strategy..."):
+                                optimal_power, coarse_time, segment_results = optimizer.optimize_constant_power(
+                                    optimization_segments, 
+                                    target_w_utilization=target_w_util
+                                )
+                                st.success(f"✅ Strategy determined: {optimal_power:.0f}W constant power")
+                            
+                            # Stage 2: High-resolution granular simulation (for results)
+                            with st.spinner("🔬 Stage 2: Running high-resolution simulation..."):
+                                granular_results, granular_time, granular_analysis = optimizer.simulate_course_detailed(
+                                    course, optimization_segments, optimal_power, target_resolution=5000
+                                )
+                                st.success(f"✅ Detailed simulation complete: {len(granular_results):,} points analyzed")
+                            
+                            # Store results in session state
+                            st.session_state['optimization_results'] = {
+                                'type': 'constant_power',
+                                'optimal_power': optimal_power,
+                                'coarse_time': coarse_time,
+                                'granular_time': granular_time,
+                                'segment_results': segment_results,
+                                'granular_results': granular_results,
+                                'granular_analysis': granular_analysis,
+                                'target_w_util': target_w_util,
+                                'optimization_segments': optimization_segments
+                            }
+                            
+                            st.success(f"🎉 Optimization complete! Total time: {granular_time/60:.1f} minutes")
+                            
+                        except Exception as e:
+                            st.error(f"❌ Optimization failed: {str(e)}")
+                            import traceback
+                            st.error(f"Details: {traceback.format_exc()}")
+
+            elif optimization_type == "Variable Pacing":
+                st.subheader("🎯 Variable Pacing Optimization")
+                
+                # Additional variable pacing parameters
+                aggressive_factor = st.slider(
+                    "Climb Aggressiveness",
+                    min_value=1.0,
+                    max_value=2.0,
+                    value=1.3,
+                    step=0.1,
+                    help="Power multiplier for climbs (1.0=CP, 2.0=very aggressive)"
+                )
+                
+                if st.button("🚀 Optimize Variable Pacing", type="primary"):
+                    with st.spinner("Running variable pacing optimization..."):
+                        try:
+                            # Always enable enhanced segmentation
+                            if hasattr(course, 'enable_enhanced_segmentation'):
+                                course.enable_enhanced_segmentation()
+                            
+                            # Stage 1: Variable pacing optimization (coarse)
+                            with st.spinner("🎯 Stage 1: Optimizing terrain-adaptive strategy..."):
+                                var_results_df, var_time, var_analysis = optimizer.optimize_variable_pacing(
+                                    optimization_segments,
+                                    target_w_utilization=target_w_util,
+                                    aggressive_factor=aggressive_factor
+                                )
+                                st.success(f"✅ Variable strategy optimized: {var_time/60:.1f} min")
+                            
+                            # Stage 2: High-resolution simulation with variable power
+                            with st.spinner("🔬 Stage 2: Running high-resolution variable simulation..."):
+                                # Extract power array from variable results
+                                power_array = var_results_df['target_power'].values
+                                
+                                granular_results, granular_time, granular_analysis = optimizer.simulate_course_detailed(
+                                    course, optimization_segments, power_array, target_resolution=5000
+                                )
+                                st.success(f"✅ Detailed simulation complete: {len(granular_results):,} points analyzed")
+                            
+                            # Store results in session state
+                            st.session_state['optimization_results'] = {
+                                'type': 'variable_pacing',
+                                'var_results_df': var_results_df,
+                                'var_analysis': var_analysis,
+                                'coarse_time': var_time,
+                                'granular_time': granular_time,
+                                'granular_results': granular_results,
+                                'granular_analysis': granular_analysis,
+                                'target_w_util': target_w_util,
+                                'aggressive_factor': aggressive_factor,
+                                'optimization_segments': optimization_segments
+                            }
+                            
+                            st.success(f"🎉 Variable pacing complete! Total time: {granular_time/60:.1f} minutes")
+                            
+                        except Exception as e:
+                            st.error(f"❌ Variable pacing failed: {str(e)}")
+                            import traceback
+                            st.error(f"Details: {traceback.format_exc()}")
+
+            # Display Results Section
+            if 'optimization_results' in st.session_state:
+                results = st.session_state['optimization_results']
+                
+                st.header("📊 Optimization Results")
+                
+                # Performance metrics summary
+                display_performance_metrics(results['granular_analysis'])
+                
+                # Main granular visualization
+                st.subheader("📈 Course Analysis")
+                
+                course_info = {
+                    'name': getattr(st.session_state, 'current_course_name', 'Course'),
+                    'distance_km': total_distance,
+                    'segments': num_segments
+                }
+                
+                try:
+                    chart = create_granular_optimization_chart(
+                        results['granular_results'],
+                        results['optimization_segments'],
+                        course_info,
+                        results['type']
+                    )
+                    st.plotly_chart(chart, width='stretch')
+                except Exception as e:
+                    st.error(f"Chart creation failed: {str(e)}")
+                    # Fallback to data table
+                    st.write("Showing raw data instead:")
+                    sample_data = results['granular_results'].sample(min(100, len(results['granular_results'])))
+                    st.dataframe(sample_data)
+                
+                # Segment summary table
+                with st.expander("📋 Segment-by-Segment Analysis"):
+                    segment_table = create_segment_summary_table(
+                        results['optimization_segments'],
+                        results['granular_analysis']
+                    )
+                    st.dataframe(segment_table, width='stretch')
+                
+                # Detailed granular data
+                with st.expander("🔬 Detailed Point-by-Point Data"):
+                    st.write(f"Full simulation used {len(results['granular_results']):,} points")
+                    
+                    # Sample for display
+                    sample_size = min(200, len(results['granular_results']))
+                    sample_df = results['granular_results'].sample(sample_size).sort_index()
+                    
+                    display_columns = [
+                        'cumulative_distance', 'gradient', 'power', 'speed_kmh', 
+                        'acceleration', 'time', 'w_remaining'
+                    ]
+                    available_columns = [col for col in display_columns if col in sample_df.columns]
+                    
+                    st.dataframe(sample_df[available_columns], width='stretch')
+                    
+                    # Download option
+                    csv_data = results['granular_results'].to_csv(index=False)
+                    st.download_button(
+                        label="📥 Download Full Results (CSV)",
+                        data=csv_data,
+                        file_name=f"optimization_results_{results['type']}.csv",
+                        mime="text/csv"
+                    )
+
+        except Exception as e:
+            st.error(f"❌ Error preparing optimization: {str(e)}")
+            st.info("Please ensure your course is properly segmented.")
 
 else:
-    st.info("👆 Please load a course and apply segmentation to begin optimization analysis.")
-    
-    st.write("### What This Tool Does")
-    st.write("""
-    - **Power Comparison**: Test different constant power outputs to see their effect on performance
-    - **Optimization**: Find the optimal constant power that minimizes time while efficiently using energy
-    - **W' Modeling**: Track anaerobic energy depletion and recovery throughout the course
-    - **Performance Metrics**: Calculate TSS, IF, power-to-weight, and other training metrics
-    - **Critical Segment Analysis**: Identify the most demanding parts of the course
-    """)
-    
-    st.write("### How to Use")
-    st.write("""
-    1. Load a course using the sidebar options
-    2. Set your rider parameters (Critical Power and W')
-    3. Choose and apply a segmentation method
-    4. Run power comparisons to see different strategies
-    5. Find optimal power for the best time/energy balance
-    """)
+    st.info("👆 Please load a course from the selection above or go to the segmentation page.")
 
 # Footer
 st.write("---")
-st.caption("Course Optimization powered by physics-based modeling and W' energy dynamics")
+st.caption("Enhanced Course Optimization with high-resolution simulation and acceleration modeling")

@@ -78,3 +78,26 @@ def get_athlete_id():
     else:
         print(f"Failed to fetch athlete data: {response.status_code} - {response.text}")
         return None
+
+def fetch_segment_details(segment_id):
+    """
+    Fetch segment details including name, distance, elevation, etc. from Strava API.
+
+    Args:
+        segment_id (int): The ID of the segment to fetch details for.
+
+    Returns:
+        dict: A dictionary with segment details if successful, else None.
+    """
+    access_token = get_access_token()
+    url = f"https://www.strava.com/api/v3/segments/{segment_id}"
+    headers = {"Authorization": f"Bearer {access_token}"}
+
+    response = requests.get(url, headers=headers)
+    
+    if response.status_code == 200:
+        # Return the parsed JSON data with segment details
+        return response.json()
+    else:
+        print(f"Failed to fetch segment details: {response.status_code} - {response.text}")
+        return None

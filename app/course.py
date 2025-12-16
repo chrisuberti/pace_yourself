@@ -11,18 +11,44 @@ load_dotenv()
 route_path = os.getenv('ROUTE_PATH')
 
 class Course:
-    def __init__(self, df):
+    def __init__(self, df, skip_processing: bool = False):
+        """
+        Initialize a Course object.
+        
+        Args:
+            df: DataFrame with GPS data (lat, lon, altitude at minimum)
+            skip_processing: If True, assume df is already processed (has gradient, 
+                           cumulative_distance, etc.). Used when loading from database.
+        """
         self.df = df.copy()
-        self.process_segment()
-        self.calculate_bearing()
-        #self.bearing_to_cardinal()
+        
+        if skip_processing:
+            # Data already processed - just validate required columns exist
+            required_cols = ['lat', 'lon', 'altitude', 'gradient', 'cumulative_distance']
+            missing = [c for c in required_cols if c not in self.df.columns]
+            if missing:
+                print(f"Warning: Pre-processed data missing columns: {missing}")
+            return
+            
+        try:
+            self.process_segment()
+            self.calculate_bearing()
+            #self.bearing_to_cardinal()
+        except Exception as e:
+            print(f"Error in Course initialization: {e}")
+            # Ensure we at least have basic columns for debugging
+            if 'cumulative_distance' not in self.df.columns:
+                print("WARNING: cumulative_distance column missing after processing")
+            raise
 
     def process_segment(self):
         print('running process segment')
         self.df["lat"] = self.df["lat"].astype(float)
         self.df["lon"] = self.df["lon"].astype(float)
         self.df["altitude"] = self.df["altitude"].astype(float)
-        # Calculate the net distance between a pair of lat/lon points
+        
+        # Calculate the net distance between a pair of lat/lon points FIRST
+        # (needed to determine appropriate smoothing window)
         self.df["delta_lat"] = self.df["lat"].diff()
         self.df["delta_lon"] = self.df["lon"].diff()
         self.df["distance"] = (self.df["delta_lat"]**2 + self.df["delta_lon"]**2)**0.5
@@ -31,14 +57,41 @@ class Course:
         self.df["distance"] = self.df["distance"] * 111139
         # Calculate the cumulative distance
         self.df["cumulative_distance"] = self.df["distance"].cumsum()
-        # Calculate the gradient between two points
-        self.df["delta_altitude"] = self.df["altitude"].diff()
-        self.df["height_gain"] = self.df["delta_altitude"].clip(lower=0)
-        self.df["height_loss"] = -self.df["delta_altitude"].clip(upper=0)
+        
+        # Smooth altitude data to reduce GPS noise before gradient calculation
+        # Use adaptive window based on point density - target ~50m of distance for smoothing
+        avg_point_spacing = self.df["distance"].median()
+        if avg_point_spacing > 0:
+            # Target 50m smoothing window, minimum 5 points, maximum 51 points
+            target_points = max(5, min(51, int(50 / avg_point_spacing)))
+            # Window must be odd
+            window_length = target_points if target_points % 2 == 1 else target_points + 1
+        else:
+            window_length = 21
+        
+        # Apply Savitzky-Golay filter for smooth altitude
+        if window_length >= 5 and len(self.df) >= window_length:
+            self.df["altitude_smoothed"] = savgol_filter(
+                self.df["altitude"].ffill().bfill(), 
+                window_length=window_length, 
+                polyorder=2
+            )
+        else:
+            self.df["altitude_smoothed"] = self.df["altitude"]
+        
+        # Calculate gradient using smoothed altitude
+        self.df["delta_altitude"] = self.df["altitude_smoothed"].diff()
+        self.df["height_gain"] = self.df["altitude"].diff().clip(lower=0)  # Use raw for actual gain
+        self.df["height_loss"] = -self.df["altitude"].diff().clip(upper=0)
+        
         # Handle inf values in the gradient and set them to zero
         self.df["gradient"] = (self.df["delta_altitude"] / self.df["distance"]) * 100
         self.df["gradient"] = self.df["gradient"].fillna(0)
         self.df['gradient'] = self.df['gradient'].replace([np.inf, -np.inf], 0)
+        
+        # Clamp gradient to realistic values (±30% is extremely steep - steeper than most paved roads)
+        max_gradient = 30.0  # percentage
+        self.df['gradient'] = self.df['gradient'].clip(lower=-max_gradient, upper=max_gradient)
 
 
     def calculate_bearing(self):
@@ -57,7 +110,7 @@ class Course:
         compass_bearing = (initial_bearing + 360) % 360
 
         self.df["bearing"] = compass_bearing
-        self.df["bearing"].fillna(0, inplace=True)  # Handle NaN for the last row
+        self.df["bearing"] = self.df["bearing"].fillna(0)  # Handle NaN for the last row
 
     def bearing_to_cardinal(self):
         directions = ['N', 'NNE', 'NE', 'ENE', 'E', 'ESE', 'SE', 'SSE', 'S', 'SSW', 'SW', 'WSW', 'W', 'WNW', 'NW', 'NNW']
@@ -119,8 +172,9 @@ class Course:
         return slider_values
 
     def aggregate_segments(self):
-        """Aggregate segment data to calculate summary statistics."""
-        self.course_segments = self.df.groupby('segment').agg({
+        """Aggregate segment data while preserving sequence order."""
+        # First, create the traditional aggregated segments for backward compatibility
+        self.course_segments_aggregated = self.df.groupby('segment').agg({
             'lat': 'mean',
             'lon': 'mean',
             'bearing': 'mean',
@@ -130,22 +184,84 @@ class Course:
             'height_loss': 'sum',
             'distance': 'sum'
         }).reset_index()
-        #flatten multiindex columns
-        self.course_segments.columns = ['_'.join(col).strip() for col in self.course_segments.columns.values]
-        self.course_segments.rename(columns={'segment_': 'segment'}, inplace=True)        #Convert distance to km instead of m
-        self.course_segments['distance_sum'] = self.course_segments['distance_sum'] / 1000
-        # Gradient is already calculated as percentage in process_segment(), no need to multiply by 100 again
-        self.course_segments['gradient_mean'] = self.course_segments['gradient_mean'].round(2)
-        self.course_segments.drop(columns = ['lat_mean', 'lon_mean'], inplace=True)
-        self.course_segments.dropna(inplace=True)
+        
+        # Flatten multiindex columns for aggregated segments
+        self.course_segments_aggregated.columns = ['_'.join(col).strip() for col in self.course_segments_aggregated.columns.values]
+        self.course_segments_aggregated.rename(columns={'segment_': 'segment'}, inplace=True)
+        self.course_segments_aggregated['distance_sum'] = self.course_segments_aggregated['distance_sum'] / 1000
+        self.course_segments_aggregated['gradient_mean'] = self.course_segments_aggregated['gradient_mean'].round(2)
+        self.course_segments_aggregated.drop(columns=['lat_mean', 'lon_mean'], inplace=True)
+        self.course_segments_aggregated.dropna(inplace=True)
+        
+        # NEW: Create sequence-preserving segments that maintain order
+        self.course_segments = self._create_sequence_preserving_segments()
+        
+        # Keep backward compatibility - if code expects old format, it still works
+        if not hasattr(self, 'use_enhanced_segmentation') or not self.use_enhanced_segmentation:
+            # For backward compatibility, keep old behavior as default
+            self.course_segments = self.course_segments_aggregated.copy()
+    
+    def _create_sequence_preserving_segments(self):
+        """Create segment sequence that preserves order while tracking segment types."""
+        # Group consecutive segments of the same type
+        segment_changes = self.df['segment'].diff().fillna(1) != 0
+        segment_groups = segment_changes.cumsum()
+        
+        # Create sequence-preserving segments
+        sequence_segments = []
+        segment_occurrence = {}
+        
+        for group_id in segment_groups.unique():
+            group_data = self.df[segment_groups == group_id]
+            segment_id = group_data['segment'].iloc[0]
+            
+            # Track occurrences of each segment type
+            if segment_id not in segment_occurrence:
+                segment_occurrence[segment_id] = 0
+            segment_occurrence[segment_id] += 1
+            
+            # Calculate aggregated metrics for this segment occurrence
+            segment_info = {
+                'segment_id': segment_id,                              # Original terrain type (1, 2, 3, 4)
+                'segment_occurrence': segment_occurrence[segment_id],   # Nth occurrence of this type
+                'segment_sequence': len(sequence_segments) + 1,        # Position in course
+                'distance_sum': group_data['distance'].sum() / 1000,   # km
+                'gradient_mean': group_data['gradient'].mean(),        # percentage
+                'altitude_mean': group_data['altitude'].mean(),        # meters
+                'altitude_min': group_data['altitude'].min(),
+                'altitude_max': group_data['altitude'].max(),
+                'bearing_mean': group_data['bearing'].mean(),
+                'height_gain_sum': group_data['height_gain'].sum(),
+                'height_loss_sum': group_data['height_loss'].sum(),
+                'start_distance': group_data['cumulative_distance'].iloc[0] / 1000,  # km
+                'end_distance': group_data['cumulative_distance'].iloc[-1] / 1000,    # km
+                'start_index': group_data.index[0],                    # Original dataframe index
+                'end_index': group_data.index[-1]                     # Original dataframe index
+            }
+            
+            sequence_segments.append(segment_info)
+        
+        # Convert to DataFrame with proper formatting
+        segments_df = pd.DataFrame(sequence_segments)
+        segments_df['gradient_mean'] = segments_df['gradient_mean'].round(2)
+        segments_df.dropna(inplace=True)
+        
+        return segments_df
+    
+    def enable_enhanced_segmentation(self):
+        """Enable the new sequence-preserving segmentation format."""
+        self.use_enhanced_segmentation = True
+        # Re-aggregate to use enhanced format
+        if hasattr(self, 'df') and 'segment' in self.df.columns:
+            self.aggregate_segments()
 
     def smooth_data(self, df_col, window_size=5):
         return (
             df_col
             .rolling(window=window_size, center=True)
             .mean()
-            .fillna(method='bfill')  # Fill the start of the DataFrame
-            .fillna(method='ffill')  # Fill the end of the DataFrame
+            .bfill()  # Fill the start of the DataFrame
+            .ffill()  # Fill the end of the DataFrame
         )
 
     def auto_segmentation(self, max_clusters=10, gradient_weight=1.0, bearing_weight=1.0, smoothing_window=5):
@@ -158,6 +274,14 @@ class Course:
             bearing_weight (float): Weight for the bearing feature.
             smoothing_window (int): Window size for smoothing gradient and bearing data.
         """
+        # Clear existing segmentation data to prevent accumulation
+        if 'segment' in self.df.columns:
+            self.df.drop(columns=['segment'], inplace=True)
+        if hasattr(self, 'course_segments'):
+            delattr(self, 'course_segments')
+        if hasattr(self, 'course_segments_aggregated'):
+            delattr(self, 'course_segments_aggregated')
+        
         def normalize_bearing(bearing):
             """Normalize bearing to handle circularity (e.g., 359 is close to 0)."""
             return np.radians(bearing)
@@ -190,7 +314,11 @@ class Course:
 
             return grad_weight * grad_diff + bear_weight * bear_diff
 
-        # Smooth gradient and bearing columns
+        # Smooth gradient and bearing columns (clear any existing smoothed columns first)
+        for col in ['gradient_smoothed', 'bearing_smoothed', 'bearing_normalized']:
+            if col in self.df.columns:
+                self.df.drop(columns=[col], inplace=True)
+                
         self.df["gradient_smoothed"] = self.smooth_data(self.df["gradient"], window_size=smoothing_window)
         self.df["bearing_smoothed"] = self.smooth_data(self.df["bearing"], window_size=smoothing_window)
 
@@ -362,66 +490,3 @@ class CourseSegmentation:
         
         if show_plot:
             plt.show()
-
-
-
-if __name__ == "__main__":
-
-    
-    for file in os.listdir():
-        try:
-            if file.endswith(".csv"):
-                print(file)
-
-                df = pd.read_csv(file)
-                df = calculate_bearing(df)
-                #normalize the gradient to below 1 breaks this a little bit
-                #df['gradient'] = df['gradient']/100
-                #print(df.head(2))
-
-
-                weight_dict = {
-                    'thresholds': [2, -2],
-                    #climbing weight, descending weight, flat weight
-                    'weights': [(0.1, 1.8), (0.5, 1), (1.8, 0.1)]
-                }
-
-                segmenter = CourseSegmentation(
-                    data=df,
-                    smoothing_window=68,    # smaller window for demonstration
-                    poly_order=2,
-                    distance_threshold=10.0, 
-                    linkage='complete',
-                    gradient_min=-0.3,     # match the extremes in this example
-                    gradient_max=0.35,
-                    weight_dict=weight_dict
-                )
-
-                labels = segmenter.cluster_course_segments()
-
-                #print("Labels:", labels)
-                print("Unique clusters found:", np.unique(labels))
-                
-                segmenter.plot_segments(save_plots=True, show_plot = False, file=file.split(".")[0])
-
-        except PermissionError:
-            pass
-
-
-'''
-v1 best hyperparameters:
-smoothing_window=70,
-poly_order=2,
-distance_threshold=10.0,
-
-
-I thin the possible short coming of this is that each course has a different number of points and thus there might be a LOT more segments if the course is longer.
-Want to avoid this somehow.......possibly measure the average distance beteween points and then use that to determine the smoothing window?
-or could use size of the course to determine the smoothing window, i.e. number of rows in the dataframe
-
-
-Ok one issue now is that we're really not changing segments based on heading, we're changing based on gradient. 
-This is not what we want. We want to change based on heading in addition 
-
-
-'''

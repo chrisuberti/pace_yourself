@@ -6,10 +6,11 @@ import time
 load_dotenv()  # Load environment variables
 
 # Retrieve initial values from .env
-client_id = os.getenv("client_id")
-client_secret = os.getenv("client_secret")
+# Support both naming conventions (STRAVA_CLIENT_ID or client_id)
+client_id = os.getenv("STRAVA_CLIENT_ID") or os.getenv("client_id")
+client_secret = os.getenv("STRAVA_CLIENT_SECRET") or os.getenv("client_secret")
 refresh_token = os.getenv("refresh_token")
-expires_at = int(os.getenv("expires_at"))
+expires_at = int(os.getenv("expires_at") or 0)
 access_token = os.getenv("access_token")
 
 

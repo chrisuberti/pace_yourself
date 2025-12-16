@@ -1,6 +1,6 @@
 # 🚴‍♂️ Pace Yourself - Cycling Performance Optimization
 
-A comprehensive cycling performance analysis and course optimization tool that integrates Strava data, physics-based modeling, and advanced pacing strategies.
+A comprehensive cycling performance analysis and course optimization tool that integrates course data from Strava or GPX, physics-based modeling, and advanced pacing strategies.
 
 ## 🆕 **Phase 1 Complete: Optimization Engine**
 

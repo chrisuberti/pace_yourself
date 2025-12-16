@@ -2,8 +2,17 @@ import sympy as sp
 import numpy as np
 import matplotlib.pyplot as plt
 from scipy.optimize import root_scalar
-from app.helpers import mps_to_mph  # Assuming this is defined in the helpers module
 import unittest
+
+# Import from local modules in the same directory
+import os
+import sys
+
+# Add the app directory to the Python path
+sys.path.append(os.path.dirname(__file__))
+
+from helpers import mps_to_mph
+from rider import Rider
 
 def calculate_speed_and_plot(Power, rho=1.225, CdA=0.3, Crr=0.005, mass=75,
                              drivetrain_efficiency=0.95, gradient=0, v_wind=0,
@@ -69,7 +78,8 @@ def calculate_speed_and_plot(Power, rho=1.225, CdA=0.3, Crr=0.005, mass=75,
         fig, ax = plt.subplots()
         ax.plot(speeds, powers, label='Power vs. Speed')
         ax.axhline(0, color='red', linestyle='--', label='Target Power')
-        ax.axvline(speed_mps, color='green', linestyle='--', label='Calculated Speed')
+        if speed_mps is not None:
+            ax.axvline(speed_mps, color='green', linestyle='--', label='Calculated Speed')
         ax.set_xlabel('Speed (m/s)')
         ax.set_ylabel('Power (W)')
         ax.legend()
@@ -163,7 +173,8 @@ class TestCalculateSpeedAndPlot(unittest.TestCase):
         self.assertAlmostEqual(rider1.CdA, 0.33, places=3)
 
         rider2 = Rider(height=1.60, weight=60, bike_type="TT", position="Aero")
-        self.assertAlmostEqual(rider2.CdA, 0.22, places=3)
+        # Expected CdA = base_CdA * height_factor = 0.22 * (1.60 / 1.75) = 0.22 * 0.914 = 0.201
+        self.assertAlmostEqual(rider2.CdA, 0.201, places=3)
 
         rider3 = Rider(height=1.90, weight=85, bike_type="Gravel", position="Hoods")
         self.assertAlmostEqual(rider3.CdA, 0.38 * (1.90 / 1.75), places=3)

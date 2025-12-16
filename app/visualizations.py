@@ -376,3 +376,489 @@ def plot_power_strategy_summary(optimization_results, course_segments=None):
     )
     
     return fig
+
+def plot_variable_pacing_strategy(variable_pacing_results, course_segments=None, 
+                                 show_comparison=True, title="Variable Pacing Strategy"):
+    """
+    Create comprehensive visualization for variable pacing strategy.
+    
+    Args:
+        variable_pacing_results (dict): Results from optimize_variable_pacing
+        course_segments (pd.DataFrame): Course segment data (optional)
+        show_comparison (bool): Whether to show constant power comparison
+        title (str): Plot title
+    
+    Returns:
+        plotly.graph_objects.Figure: Multi-panel variable pacing visualization
+    """
+    segment_data = variable_pacing_results['segment_breakdown']
+    
+    # Create subplots
+    rows = 3 if show_comparison else 2
+    subplot_titles = [
+        'Power Strategy by Terrain',
+        'W\' Management Throughout Course'
+    ]
+    if show_comparison:
+        subplot_titles.append('Variable vs Constant Power Comparison')
+    
+    fig = make_subplots(
+        rows=rows, cols=1,
+        subplot_titles=subplot_titles,
+        shared_xaxes=True,
+        vertical_spacing=0.08,
+        specs=[[{"secondary_y": True}] for _ in range(rows)]
+    )
+    
+    # Calculate cumulative distance for x-axis
+    segment_data = segment_data.copy()
+    segment_data['cumulative_distance'] = segment_data['distance'].cumsum() / 1000  # Convert to km
+    segment_data['distance_start'] = segment_data['cumulative_distance'] - (segment_data['distance'] / 1000)
+    
+    # 1. Power Strategy by Terrain (Step function per coding standards)
+    # Create step function for power
+    x_power = []
+    y_power = []
+    terrain_colors = []
+    
+    terrain_color_map = {
+        'Steep Climb': 'red',
+        'Moderate Climb': 'orange', 
+        'Flat': 'blue',
+        'Moderate Descent': 'green',
+        'Steep Descent': 'darkgreen'
+    }
+    
+    for _, segment in segment_data.iterrows():
+        # Add start point
+        x_power.extend([segment['distance_start'], segment['cumulative_distance']])
+        y_power.extend([segment['target_power'], segment['target_power']])
+        terrain_colors.extend([terrain_color_map.get(segment['terrain_type'], 'gray')] * 2)
+    
+    # Add power strategy line
+    fig.add_trace(
+        go.Scatter(
+            x=x_power, y=y_power,
+            mode='lines',
+            line=dict(width=3, shape='hv'),  # Step function shape
+            name='Target Power',
+            hovertemplate='Distance: %{x:.1f} km<br>Power: %{y:.0f} W<extra></extra>'
+        ),
+        row=1, col=1
+    )
+    
+    # Add gradient bars on secondary y-axis
+    fig.add_trace(
+        go.Bar(
+            x=segment_data['cumulative_distance'] - (segment_data['distance'] / 2000),  # Center bars
+            y=segment_data['gradient'] * 100,
+            width=segment_data['distance'] / 1000,
+            name='Gradient %',
+            opacity=0.3,
+            marker_color=[terrain_color_map.get(t, 'gray') for t in segment_data['terrain_type']],
+            hovertemplate='Distance: %{x:.1f} km<br>Gradient: %{y:.1f}%<extra></extra>'
+        ),
+        row=1, col=1, secondary_y=True
+    )
+      # 2. W' Management Throughout Course
+    x_w = []
+    y_w = []
+    
+    # Start at full W' (use the optimizer's W' value)
+    initial_w_prime = variable_pacing_results.get('final_w_remaining', 0) + \
+                     (variable_pacing_results.get('w_prime_utilization_percent', 0) / 100) * 25000  # Estimate
+    
+    # Better approach: Use the first segment's w_remaining + w_used to get initial W'
+    first_segment = segment_data.iloc[0]
+    if 'w_remaining' in first_segment and 'w_used_segment' in first_segment:
+        # This gives us the W' at the END of the first segment plus what was used in that segment
+        initial_w_prime = first_segment['w_remaining'] + first_segment['w_used_segment']
+    else:
+        initial_w_prime = 25000  # Default assumption
+    
+    x_w.append(0)
+    y_w.append(initial_w_prime)
+    
+    for _, segment in segment_data.iterrows():
+        x_w.append(segment['cumulative_distance'])
+        y_w.append(segment['w_remaining'])
+    
+    fig.add_trace(
+        go.Scatter(
+            x=x_w, y=np.array(y_w) / 1000,  # Convert to kJ
+            mode='lines+markers',
+            line=dict(width=3, color='purple'),
+            name='W\' Remaining (kJ)',
+            hovertemplate='Distance: %{x:.1f} km<br>W\' Remaining: %{y:.1f} kJ<extra></extra>'
+        ),
+        row=2, col=1
+    )
+    # Add target W' utilization line
+    target_utilization = variable_pacing_results.get('w_prime_utilization_percent', 85) / 100
+    target_w_remaining = initial_w_prime * (1 - target_utilization)
+    
+    # Add horizontal line for target W' level using add_shape
+    fig.add_shape(
+        type="line",
+        x0=0, x1=max(x_w), 
+        y0=target_w_remaining / 1000, y1=target_w_remaining / 1000,
+        line=dict(color="red", dash="dash"),
+        row=2, col=1
+    )
+    
+    # Add annotation for target W' level
+    fig.add_annotation(
+        x=max(x_w) * 0.7,  # Position annotation at 70% of the x-axis
+        y=target_w_remaining / 1000,
+        text=f"Target W' Level ({target_utilization*100:.0f}% utilization)",
+        showarrow=True,
+        arrowhead=2,
+        arrowsize=1,
+        arrowwidth=2,
+        arrowcolor="red",
+        row=2, col=1
+    )
+    
+    # 3. Comparison with constant power (if requested)
+    if show_comparison:
+        comparison = variable_pacing_results.get('comparison_to_constant_power', {})
+        
+        # Create comparison bar chart
+        categories = ['Variable Power', 'Constant Power']
+        times = [
+            variable_pacing_results['total_time_minutes'],
+            comparison.get('constant_time_minutes', 0)
+        ]
+        speeds = [
+            variable_pacing_results['average_speed_kmh'],
+            comparison.get('constant_avg_speed_kmh', 0)
+        ]
+        
+        fig.add_trace(
+            go.Bar(
+                x=categories, y=times,
+                name='Time (minutes)',
+                text=[f"{t:.1f} min" for t in times],
+                textposition='outside',
+                marker_color=['green', 'blue']
+            ),
+            row=3, col=1
+        )
+        
+        # Add speed on secondary y-axis
+        fig.add_trace(
+            go.Scatter(
+                x=categories, y=speeds,
+                mode='markers+text',
+                text=[f"{s:.1f} km/h" for s in speeds],
+                textposition='top center',
+                marker=dict(size=12, color=['green', 'blue']),
+                name='Avg Speed (km/h)',
+                yaxis='y2'
+            ),
+            row=3, col=1, secondary_y=True
+        )
+    
+    # Update layout
+    fig.update_layout(
+        title=title,
+        height=800 if show_comparison else 600,
+        showlegend=True,
+        hovermode='x unified'
+    )
+    
+    # Update axes labels
+    fig.update_xaxes(title_text="Distance (km)", row=rows, col=1)
+    fig.update_yaxes(title_text="Power (W)", row=1, col=1)
+    fig.update_yaxes(title_text="Gradient (%)", row=1, col=1, secondary_y=True)
+    fig.update_yaxes(title_text="W' Remaining (kJ)", row=2, col=1)
+    
+    if show_comparison:
+        fig.update_yaxes(title_text="Time (minutes)", row=3, col=1)
+        fig.update_yaxes(title_text="Speed (km/h)", row=3, col=1, secondary_y=True)
+    
+    return fig
+
+
+def plot_pacing_strategy_comparison(constant_results, variable_results, course_segments=None):
+    """
+    Create side-by-side comparison of constant vs variable pacing strategies.
+    
+    Args:
+        constant_results (dict): Results from constant power optimization
+        variable_results (dict): Results from variable pacing optimization
+        course_segments (pd.DataFrame): Course segment data (optional)
+    
+    Returns:
+        plotly.graph_objects.Figure: Comparison visualization
+    """
+    fig = make_subplots(
+        rows=2, cols=2,
+        subplot_titles=[
+            'Power Distribution Comparison',
+            'Speed Profile Comparison',
+            'Performance Metrics',
+            'W\' Utilization Strategy'
+        ],
+        specs=[
+            [{"secondary_y": False}, {"secondary_y": False}],
+            [{"type": "table"}, {"secondary_y": False}]
+        ]
+    )
+    
+    # Extract segment data
+    var_segments = variable_results['segment_breakdown']
+    var_segments['cumulative_distance'] = var_segments['distance'].cumsum() / 1000
+    
+    # 1. Power Distribution Comparison
+    # Variable power as step function
+    x_var = []
+    y_var = []
+    for _, segment in var_segments.iterrows():
+        dist_start = segment['cumulative_distance'] - (segment['distance'] / 1000)
+        x_var.extend([dist_start, segment['cumulative_distance']])
+        y_var.extend([segment['target_power'], segment['target_power']])
+    
+    fig.add_trace(
+        go.Scatter(
+            x=x_var, y=y_var,
+            mode='lines',
+            line=dict(width=3, shape='hv', color='red'),
+            name='Variable Power',
+            hovertemplate='Distance: %{x:.1f} km<br>Power: %{y:.0f} W<extra></extra>'
+        ),
+        row=1, col=1
+    )
+    
+    # Constant power as horizontal line
+    const_power = constant_results.get('optimal_power', 0)
+    max_distance = var_segments['cumulative_distance'].max()
+    
+    fig.add_trace(
+        go.Scatter(
+            x=[0, max_distance], y=[const_power, const_power],
+            mode='lines',
+            line=dict(width=3, color='blue', dash='dash'),
+            name=f'Constant Power ({const_power:.0f}W)',
+            hovertemplate='Power: %{y:.0f} W<extra></extra>'
+        ),
+        row=1, col=1
+    )
+    
+    # 2. Speed Profile Comparison
+    fig.add_trace(
+        go.Scatter(
+            x=var_segments['cumulative_distance'],
+            y=var_segments['speed'] * 3.6,  # Convert to km/h
+            mode='lines+markers',
+            line=dict(color='red'),
+            name='Variable Speed',
+            hovertemplate='Distance: %{x:.1f} km<br>Speed: %{y:.1f} km/h<extra></extra>'
+        ),
+        row=1, col=2
+    )
+    
+    # For constant power, we'd need to calculate speed profile
+    # For now, show average speed as horizontal line
+    const_avg_speed = constant_results.get('average_speed_kmh', 0)
+    fig.add_trace(
+        go.Scatter(
+            x=[0, max_distance], y=[const_avg_speed, const_avg_speed],
+            mode='lines',
+            line=dict(color='blue', dash='dash'),
+            name=f'Constant Avg Speed ({const_avg_speed:.1f} km/h)',
+            hovertemplate='Speed: %{y:.1f} km/h<extra></extra>'
+        ),
+        row=1, col=2
+    )
+    
+    # 3. Performance Metrics Table
+    comparison_data = variable_results.get('comparison_to_constant_power', {})
+    
+    metrics_data = [
+        ['Metric', 'Variable Pacing', 'Constant Power', 'Improvement'],
+        ['Time (minutes)', f"{variable_results['total_time_minutes']:.1f}", 
+         f"{comparison_data.get('constant_time_minutes', 0):.1f}",
+         f"{comparison_data.get('time_savings_seconds', 0):.0f}s"],
+        ['Avg Speed (km/h)', f"{variable_results['average_speed_kmh']:.1f}",
+         f"{comparison_data.get('constant_avg_speed_kmh', 0):.1f}",
+         f"+{comparison_data.get('speed_improvement_kmh', 0):.1f}"],
+        ['W\' Utilization (%)', f"{variable_results['w_prime_utilization_percent']:.1f}",
+         f"{constant_results.get('w_prime_utilization_percent', 0):.1f}",
+         f"±{variable_results['w_prime_utilization_percent'] - constant_results.get('w_prime_utilization_percent', 0):.1f}"],
+        ['Max Power (W)', f"{variable_results['power_distribution']['max_power']:.0f}",
+         f"{const_power:.0f}",
+         f"+{variable_results['power_distribution']['max_power'] - const_power:.0f}"]
+    ]
+    
+    fig.add_trace(
+        go.Table(
+            header=dict(values=metrics_data[0], align='center'),
+            cells=dict(values=list(zip(*metrics_data[1:])), align='center')
+        ),
+        row=2, col=1
+    )
+      # 4. W' Utilization Strategy
+    x_w = []
+    y_w = []
+    
+    # Get initial W' from first segment
+    first_segment = var_segments.iloc[0]
+    if 'w_remaining' in first_segment and 'w_used_segment' in first_segment:
+        initial_w_prime = first_segment['w_remaining'] + first_segment['w_used_segment']
+    else:
+        initial_w_prime = 25000  # Default assumption
+    
+    x_w.append(0)
+    y_w.append(initial_w_prime / 1000)  # Start with full W' in kJ
+    
+    for _, segment in var_segments.iterrows():
+        x_w.append(segment['cumulative_distance'])
+        y_w.append(segment['w_remaining'] / 1000)
+    
+    fig.add_trace(
+        go.Scatter(
+            x=x_w, y=y_w,
+            mode='lines+markers',
+            line=dict(width=3, color='red'),
+            name='Variable W\' Profile',
+            hovertemplate='Distance: %{x:.1f} km<br>W\' Remaining: %{y:.1f} kJ<extra></extra>'
+        ),
+        row=2, col=2
+    )
+    
+    # Add constant power W' profile (would need simulation)
+    # For now, show final W' remaining as horizontal line
+    const_final_w = constant_results.get('final_w_remaining', 0) / 1000
+    fig.add_trace(
+        go.Scatter(
+            x=[0, max_distance], y=[const_final_w, const_final_w],
+            mode='lines',
+            line=dict(color='blue', dash='dash'),
+            name=f'Constant Final W\' ({const_final_w:.1f} kJ)',
+            hovertemplate='W\' Remaining: %{y:.1f} kJ<extra></extra>'
+        ),
+        row=2, col=2
+    )
+    
+    # Update layout
+    fig.update_layout(
+        title="Pacing Strategy Comparison: Variable vs Constant Power",
+        height=800,
+        showlegend=True
+    )
+    
+    # Update axes
+    fig.update_xaxes(title_text="Distance (km)")
+    fig.update_yaxes(title_text="Power (W)", row=1, col=1)
+    fig.update_yaxes(title_text="Speed (km/h)", row=1, col=2)
+    fig.update_yaxes(title_text="W' Remaining (kJ)", row=2, col=2)
+    
+    return fig
+
+
+def plot_terrain_power_analysis(variable_pacing_results):
+    """
+    Analyze power allocation by terrain type for variable pacing strategy.
+    
+    Args:
+        variable_pacing_results (dict): Results from variable pacing optimization
+    
+    Returns:
+        plotly.graph_objects.Figure: Terrain-based power analysis
+    """
+    segment_data = variable_pacing_results['segment_breakdown']
+    
+    fig = make_subplots(
+        rows=2, cols=2,
+        subplot_titles=[
+            'Power by Terrain Type',
+            'Time Distribution by Terrain',
+            'W\' Usage by Terrain',
+            'Efficiency Analysis'
+        ],
+        specs=[[{"type": "xy"}, {"type": "domain"}],
+               [{"type": "xy"}, {"type": "xy"}]]
+    )
+    
+    # Group by terrain type
+    terrain_groups = segment_data.groupby('terrain_type').agg({
+        'target_power': ['mean', 'std', 'count'],
+        'time': 'sum',
+        'w_used_segment': 'sum',
+        'distance': 'sum',
+        'speed': 'mean'
+    }).round(2)
+    
+    terrain_types = terrain_groups.index.tolist()
+    
+    # 1. Power by Terrain Type (Box plot style)
+    fig.add_trace(
+        go.Bar(
+            x=terrain_types,
+            y=terrain_groups[('target_power', 'mean')],
+            error_y=dict(type='data', array=terrain_groups[('target_power', 'std')]),
+            name='Avg Power (W)',
+            text=[f"{p:.0f}W" for p in terrain_groups[('target_power', 'mean')]],
+            textposition='outside'
+        ),
+        row=1, col=1
+    )
+    
+    # 2. Time Distribution by Terrain
+    fig.add_trace(
+        go.Pie(
+            labels=terrain_types,
+            values=terrain_groups[('time', 'sum')],
+            name='Time Distribution',
+            textinfo='label+percent',
+            hovertemplate='%{label}<br>Time: %{value:.0f}s<br>Percentage: %{percent}<extra></extra>'
+        ),
+        row=1, col=2
+    )
+    
+    # 3. W' Usage by Terrain
+    fig.add_trace(
+        go.Bar(
+            x=terrain_types,
+            y=terrain_groups[('w_used_segment', 'sum')] / 1000,  # Convert to kJ
+            name='W\' Used (kJ)',
+            text=[f"{w:.1f}kJ" for w in terrain_groups[('w_used_segment', 'sum')] / 1000],
+            textposition='outside',
+            marker_color='orange'
+        ),
+        row=2, col=1
+    )
+    
+    # 4. Efficiency Analysis (Speed vs Power)
+    power_means = terrain_groups[('target_power', 'mean')]
+    speed_means = terrain_groups[('speed', 'mean')] * 3.6  # Convert to km/h
+    
+    fig.add_trace(
+        go.Scatter(
+            x=power_means,
+            y=speed_means,
+            mode='markers+text',
+            text=terrain_types,
+            textposition='top center',
+            marker=dict(size=15, color='green'),
+            name='Power vs Speed Efficiency',
+            hovertemplate='Terrain: %{text}<br>Power: %{x:.0f}W<br>Speed: %{y:.1f} km/h<extra></extra>'
+        ),
+        row=2, col=2
+    )
+    
+    # Update layout
+    fig.update_layout(
+        title="Terrain-Based Power Analysis",
+        height=700,
+        showlegend=False
+    )
+    
+    # Update axes
+    fig.update_yaxes(title_text="Power (W)", row=1, col=1)
+    fig.update_yaxes(title_text="W' Used (kJ)", row=2, col=1)
+    fig.update_xaxes(title_text="Power (W)", row=2, col=2)
+    fig.update_yaxes(title_text="Speed (km/h)", row=2, col=2)
+    
+    return fig

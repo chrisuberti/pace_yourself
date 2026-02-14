@@ -91,17 +91,78 @@ class CourseDatabase:
             # Column already exists, ignore
             pass
     
-    def store_course(self, course_data: Dict[str, Any]) -> str:
+    def _process_raw_gps_data(self, raw_gps_data: List[Dict]) -> tuple:
         """
-        Store course data without segmentation information
+        Process raw GPS data using the Course class.
+        
+        Args:
+            raw_gps_data: List of dicts with lat, lon, altitude
+            
+        Returns:
+            tuple: (processed_data_list, total_distance_km, total_elevation_gain_m)
+        """
+        if not raw_gps_data or not isinstance(raw_gps_data, list) or len(raw_gps_data) < 2:
+            return [], 0.0, 0
+        
+        try:
+            import pandas as pd
+            from app.course import Course
+            
+            # Create DataFrame from raw GPS data
+            df = pd.DataFrame(raw_gps_data)
+            
+            # Ensure required columns exist
+            if not all(col in df.columns for col in ['lat', 'lon']):
+                return [], 0.0, 0
+            
+            # Handle altitude column naming
+            if 'altitude' not in df.columns and 'ele' in df.columns:
+                df['altitude'] = df['ele']
+            elif 'altitude' not in df.columns:
+                df['altitude'] = 0  # Default if no altitude data
+            
+            # Process using Course class
+            course = Course(df, skip_processing=False)
+            
+            # Extract processed data
+            processed_df = course.df
+            total_distance_km = processed_df['cumulative_distance'].max() / 1000
+            total_elevation_gain = processed_df['height_gain'].sum()
+            
+            # Convert to list of dicts for JSON storage
+            processed_data = processed_df.to_dict('records')
+            
+            return processed_data, total_distance_km, total_elevation_gain
+            
+        except Exception as e:
+            print(f"Error processing GPS data: {e}")
+            return [], 0.0, 0
+    
+    def store_course(self, course_data: Dict[str, Any], auto_process: bool = True) -> str:
+        """
+        Store course data with automatic GPS processing.
         
         Args:
             course_data: Dictionary containing course information
+            auto_process: If True, automatically process raw GPS data (default: True)
             
         Returns:
             course_id: Unique identifier for the stored course
         """
         course_id = str(uuid.uuid4())
+        
+        # Get raw GPS data
+        raw_gps_data = course_data.get('raw_gps_data', [])
+        gps_points_count = len(raw_gps_data) if isinstance(raw_gps_data, list) else 0
+        
+        # Auto-process if requested and raw data exists but processed data doesn't
+        processed_data = course_data.get('processed_data', [])
+        total_distance_km = course_data.get('total_distance_km', 0.0)
+        total_elevation_gain_m = course_data.get('total_elevation_gain_m', 0)
+        
+        if auto_process and raw_gps_data and not processed_data:
+            processed_data, total_distance_km, total_elevation_gain_m = self._process_raw_gps_data(raw_gps_data)
+            print(f"Auto-processed course: {len(processed_data)} points, {total_distance_km:.2f}km, {total_elevation_gain_m:.0f}m gain")
         
         sql = """
         INSERT INTO courses (
@@ -111,25 +172,85 @@ class CourseDatabase:
         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """
         
-        # Calculate GPS points count
-        raw_gps_data = course_data.get('raw_gps_data', [])
-        gps_points_count = len(raw_gps_data) if isinstance(raw_gps_data, list) else 0
-        
         self.conn.execute(sql, (
             course_id,
             course_data.get('name', 'Unknown Course'),
             course_data.get('strava_segment_id'),
             course_data.get('created_by', 'system'),
             json.dumps(raw_gps_data),
-            json.dumps(course_data.get('processed_data', {})),
-            course_data.get('total_distance_km', 0.0),
-            course_data.get('total_elevation_gain_m', 0),
+            json.dumps(processed_data),
+            total_distance_km,
+            total_elevation_gain_m,
             gps_points_count,
             course_data.get('course_type', 'unknown')
         ))
         
         self.conn.commit()
         return course_id
+    
+    def reprocess_course(self, course_id: str) -> bool:
+        """
+        Reprocess an existing course's raw GPS data.
+        Useful for fixing courses that were stored without processing.
+        
+        Args:
+            course_id: The course to reprocess
+            
+        Returns:
+            bool: True if successful, False otherwise
+        """
+        course_data = self.get_course(course_id)
+        if not course_data:
+            print(f"Course {course_id} not found")
+            return False
+        
+        raw_gps_data = course_data.get('raw_gps_data', [])
+        if not raw_gps_data:
+            print(f"Course {course_id} has no raw GPS data")
+            return False
+        
+        processed_data, total_distance_km, total_elevation_gain_m = self._process_raw_gps_data(raw_gps_data)
+        
+        if not processed_data:
+            print(f"Failed to process GPS data for course {course_id}")
+            return False
+        
+        # Update the course
+        sql = """
+        UPDATE courses 
+        SET processed_data = ?, total_distance_km = ?, total_elevation_gain_m = ?, updated_at = CURRENT_TIMESTAMP
+        WHERE course_id = ?
+        """
+        self.conn.execute(sql, (
+            json.dumps(processed_data),
+            total_distance_km,
+            total_elevation_gain_m,
+            course_id
+        ))
+        self.conn.commit()
+        print(f"Reprocessed course {course_id}: {len(processed_data)} points, {total_distance_km:.2f}km, {total_elevation_gain_m:.0f}m gain")
+        return True
+    
+    def reprocess_all_courses(self) -> int:
+        """
+        Reprocess all courses that have raw GPS data but no processed data.
+        
+        Returns:
+            int: Number of courses reprocessed
+        """
+        courses = self.conn.execute(
+            "SELECT course_id, course_name FROM courses"
+        ).fetchall()
+        
+        count = 0
+        for c in courses:
+            course_data = self.get_course(c['course_id'])
+            if course_data.get('raw_gps_data') and not course_data.get('processed_data'):
+                print(f"Reprocessing: {c['course_name']}")
+                if self.reprocess_course(c['course_id']):
+                    count += 1
+        
+        return count
     
     def get_course(self, course_id: str) -> Optional[Dict[str, Any]]:
         """Retrieve course data by ID"""

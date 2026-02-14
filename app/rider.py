@@ -108,87 +108,132 @@ class Rider:
                  rider_type=None, critical_power=None, 
                  best_efforts=None, 
                  days=60, rider_id=None):
-        self.height = height  # Rider height in meters
-        self.weight = weight  # Rider weight in kilograms
-        self.bike_type = bike_type  # Bike type (e.g., Road, TT, Gravel, MTB)
-        self.position = position  # Riding position (e.g., Hoods, Drops, Aero)
+        """
+        Initialize a Rider with critical power and W' (WTank) calculated from one of three methods:
+        
+        METHOD A - Profile Estimation (rider_type + critical_power):
+            If you know your CP and rider type, W' is estimated from typical profiles.
+            Example: Rider(height=1.80, weight=75, rider_type="all_rounder", critical_power=250)
+            
+        METHOD B - Manual Best Efforts (best_efforts dict):
+            Provide your own power-duration data for curve fitting.
+            Example: Rider(height=1.80, weight=75, best_efforts={60: 400, 300: 320, 1200: 270})
+            
+        METHOD C - Strava API (default when no power data provided):
+            Automatically fetches your best efforts from Strava over the last N days.
+            Requires Strava authentication. Results are cached in the database.
+            Example: Rider(height=1.80, weight=75, days=90)
+        
+        Args:
+            height: Rider height in meters
+            weight: Total weight in kg (rider + bike + gear)
+            bike_type: "Road", "TT", "Gravel", or "MTB"
+            position: "Hoods", "Drops", "Aero", or "Flat"
+            rider_type: For Method A - "time_trialist", "sprinter", or "all_rounder"
+            critical_power: For Method A - your critical power in watts
+            best_efforts: For Method B - dict of {duration_seconds: power_watts}
+            days: For Method C - number of days to look back in Strava (default 60)
+            rider_id: Optional - used to cache/retrieve data from local database
+        """
+        # Core physical attributes
+        self.height = height
+        self.weight = weight
+        self.bike_type = bike_type
+        self.position = position
         self.CdA = self.estimate_CdA()
+        
+        # Power attributes - will be populated by one of the methods below
         self.critical_power = critical_power
         self.WTank = None
+        self.best_efforts = None
+        self.WTank_calculator = None
         
-        #if rider id isn't supplied, get the rider_id from strava
-        #rider id is used to store the best efforts in the database for strava calls so we don't hit hte api too much and get throttled
-        if (rider_id==None)&(rider_type==None)&(critical_power==None) & (best_efforts==None):
-            #make sure to only call this condition if there are no other ways to estimate power supplied
-            try:
-                self.strava_athlete_id = get_athlete_id()
-                self.rider_id = str(self.strava_athlete_id)  # Use Strava athlete ID as rider ID
-            except Exception as e:
-                print(f"Failed to get Strava athlete ID: {e}")
-                self.strava_athlete_id = None
-                self.rider_id = None
-        elif rider_id:
-            self.rider_id = rider_id
-            self.strava_athlete_id = None  # Will be set if we load from DB
-        else:
-            self.rider_id = None
-            self.strava_athlete_id = None
+        # Rider identification
+        self.rider_id = rider_id
+        self.strava_athlete_id = None
         
-
-        #important block to populate critical power and WTank
-
+        # ============================================================
+        # METHOD A: Profile-based estimation (rider_type + critical_power)
+        # ============================================================
         if rider_type and critical_power:
+            print(f"Method A: Estimating W' from rider profile ({rider_type}) and CP ({critical_power}W)")
             self.WTank_calculator = WTankCalculator(rider_type=rider_type, critical_power=critical_power)
             self.WTank = self.WTank_calculator.calculate_w_tank()
-        else: 
-            #Try the few different methods in order to get your best_efforts variable if we're not estimating based on
-            #load the best efforts from the database if they exist and pull out all the rider_ids
-            # if the rider_id is not in the database, then we need to calculate the best efforts from strava
-
-            #check if the database exists and get existing rider IDs
-            rider_ids = self.get_existing_rider_ids()
+            self.critical_power = self.WTank_calculator.critical_power
+            self.best_efforts = self.WTank_calculator.best_efforts  # Store the estimated best efforts
+            return  # Done - no need to check other methods
+        
+        # ============================================================
+        # METHOD B: Manual best efforts provided
+        # ============================================================
+        if best_efforts:
+            print(f"Method B: Calculating CP and W' from provided best efforts")
+            self.best_efforts = best_efforts
+            self.WTank_calculator = WTankCalculator(best_efforts=best_efforts)
+            self.WTank = self.WTank_calculator.calculate_w_tank()
+            self.critical_power = self.WTank_calculator.critical_power
+            return  # Done
+        
+        # ============================================================
+        # METHOD C: Database lookup or Strava API
+        # ============================================================
+        # First, try to get rider_id from Strava if not provided
+        if not self.rider_id:
+            try:
+                self.strava_athlete_id = get_athlete_id()
+                self.rider_id = str(self.strava_athlete_id)
+                print(f"Got Strava athlete ID: {self.rider_id}")
+            except Exception as e:
+                print(f"No Strava authentication available: {e}")
+                print("Tip: Provide rider_type + critical_power, or best_efforts dict")
+                return  # Can't proceed without identification
+        
+        # Check if we have cached data in the database
+        existing_rider_ids = self.get_existing_rider_ids()
+        
+        if self.rider_id in existing_rider_ids:
+            # Try to load from database
+            if self.load_rider_info_from_db():
+                print(f"Method C: Loaded cached rider data for ID: {self.rider_id}")
+                if self.critical_power and self.WTank:
+                    self.WTank_calculator = WTankCalculator(critical_power=self.critical_power)
+                    # Also load best efforts if available
+                    self.load_best_efforts_from_db()
+                    return  # Done - loaded from cache
             
-            if best_efforts:
-                self.best_efforts = best_efforts
-            elif self.rider_id and self.rider_id in rider_ids:
-                # Load existing rider data from database
-                if self.load_rider_info_from_db():
-                    print(f"Loaded existing rider data for ID: {self.rider_id}")
-                    # If we have critical power from DB, we don't need to recalculate
-                    if self.critical_power and self.WTank:
-                        # Data already loaded from DB, create calculator for consistency
-                        self.WTank_calculator = WTankCalculator(critical_power=self.critical_power)
-                        return  # Skip the rest of initialization
-                self.load_best_efforts_from_db()
-            else:
-                try:
-                    #This one hit's the Strava API and is call intensive:
-                    if not hasattr(self, 'strava_athlete_id') or not self.strava_athlete_id:
-                        try:
-                            self.strava_athlete_id = get_athlete_id()
-                            if not self.rider_id:
-                                self.rider_id = str(self.strava_athlete_id)
-                        except Exception as e:
-                            print(f"Failed to get Strava athlete ID: {e}")
-                            self.strava_athlete_id = None
-                    
-                    best_efforts = self.get_best_power_from_strava(days)
-                    self.best_efforts = best_efforts  # Store the best_efforts as instance variable
-                    self.save_best_efforts_to_db()
-                except Exception as e:
-                    print(f"Error calculating WTank, user probably not authenticated from strava, see error: {e}")
-                    print('OR you need to include a rider_type and critical_power')
-                    best_efforts = None  # Set to None if error occurs
-
-            # Only create WTankCalculator and calculate WTank if we have the necessary data
-            if hasattr(self, 'best_efforts') or best_efforts:
-                self.WTank_calculator = WTankCalculator(critical_power=critical_power, best_efforts=getattr(self, 'best_efforts', best_efforts))
+            # If rider_info didn't have CP/WTank, try loading best_efforts
+            self.load_best_efforts_from_db()
+            if self.best_efforts:
+                print(f"Loaded cached best efforts, recalculating CP and W'")
+                self.WTank_calculator = WTankCalculator(best_efforts=self.best_efforts)
                 self.WTank = self.WTank_calculator.calculate_w_tank()
                 self.critical_power = self.WTank_calculator.critical_power
+                return  # Done
+        
+        # No cached data - fetch from Strava API
+        try:
+            print(f"Method C: Fetching best efforts from Strava (last {days} days)...")
+            if not self.strava_athlete_id:
+                self.strava_athlete_id = get_athlete_id()
+                if not self.rider_id:
+                    self.rider_id = str(self.strava_athlete_id)
+            
+            self.best_efforts = self.get_best_power_from_strava(days)
+            
+            if self.best_efforts:
+                self.WTank_calculator = WTankCalculator(best_efforts=self.best_efforts)
+                self.WTank = self.WTank_calculator.calculate_w_tank()
+                self.critical_power = self.WTank_calculator.critical_power
+                
+                # Cache for future use
+                self.save_best_efforts_to_db()
+                print(f"Calculated and cached: CP={self.critical_power:.0f}W, W'={self.WTank:.0f}J")
             else:
-                # Set default values if we can't calculate WTank
-                self.WTank = None
-                self.WTank_calculator = None
+                print("No power data found in Strava activities")
+                
+        except Exception as e:
+            print(f"Error fetching from Strava: {e}")
+            print("Tip: Provide rider_type + critical_power, or best_efforts dict")
 
     def estimate_CdA(self):
         """

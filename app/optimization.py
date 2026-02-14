@@ -429,68 +429,86 @@ class CourseOptimizer:
                                          course_analysis: Dict[str, Any],
                                          target_w_utilization: float,
                                          aggressive_factor: float) -> np.ndarray:
-        """Generate initial power strategy based on terrain heuristics."""
+        """
+        Generate initial power strategy using continuous gradient-based scaling.
+        
+        Instead of hard terrain thresholds (which fail with averaged gradients from 
+        equal segmentation), this uses a continuous mapping from gradient to power.
+        The physics principle: extra watts save more time on uphills (high resistance)
+        than on flats/descents, so allocate power proportionally to resistance.
+        """
         num_segments = len(course_segments)
         power_strategy = np.zeros(num_segments)
         
-        # Calculate target W' to use
+        # Target W' budget
         target_w_to_use = self.w_prime * target_w_utilization
         
-        # Get climbing segments for W' allocation
-        climbing_segments = course_analysis['climbing_segments']
-        climb_distance = course_analysis['climb_distance']
+        gradients = course_segments['gradient'].values
+        distances = course_segments['distance'].values
         
-        if climb_distance > 0:
-            # More conservative W' allocation approach
-            # Reserve some W' for unexpected needs (only use 80% of target)
-            available_w_budget = target_w_to_use * 0.8
-            
-            # Calculate total climb time to distribute W' more realistically
-            total_climb_time = 0
-            climb_segments_info = []
-            
-            for i, (_, segment) in enumerate(course_segments.iterrows()):
-                gradient = segment['gradient']
-                distance = segment['distance']
-                
-                if gradient > 0.03:  # Climbing segment
-                    # Estimate realistic climbing time
-                    estimated_speed = max(3.0, 12.0 - gradient * 60)  # More conservative speed estimate
-                    estimated_time = distance / estimated_speed
-                    total_climb_time += estimated_time
-                    climb_segments_info.append((i, distance, estimated_time, gradient))
-            
-            # Distribute W' budget based on time rather than distance
-            w_rate = available_w_budget / max(total_climb_time, 1)  # W'/second budget
+        # Compute a "resistance score" for each segment: higher = harder = more power needed
+        # Use gradient as the primary driver, with a baseline offset so even flat segments
+        # participate in the optimization (just less so)
+        resistance_scores = np.zeros(num_segments)
+        for i in range(num_segments):
+            g = gradients[i]
+            # Continuous score: positive gradient → high resistance, negative → low
+            # Shift so that gradient=0 gets a small positive score (still worth some effort)
+            resistance_scores[i] = g + 0.01  # offset so flat is slightly positive
         
-        # Allocate power based on terrain type
-        for i, (_, segment) in enumerate(course_segments.iterrows()):
-            gradient = segment['gradient']
-            distance = segment['distance']
+        # Separate into segments that should get above-CP power (positive resistance)
+        # and segments that should recover (negative resistance)
+        above_cp_mask = resistance_scores > 0
+        below_cp_mask = ~above_cp_mask
+        
+        # Estimate total time at CP to budget W' distribution
+        total_above_cp_time = 0
+        segment_estimated_times = np.zeros(num_segments)
+        for i in range(num_segments):
+            # Rough speed estimate at CP
+            estimated_speed = max(3.0, 12.0 - gradients[i] * 80)
+            segment_estimated_times[i] = distances[i] / estimated_speed
+            if above_cp_mask[i]:
+                total_above_cp_time += segment_estimated_times[i]
+        
+        if total_above_cp_time > 0:
+            # Distribute W' budget weighted by resistance × time
+            # Higher resistance segments get more of the W' pie
+            above_cp_weights = np.zeros(num_segments)
+            for i in range(num_segments):
+                if above_cp_mask[i]:
+                    above_cp_weights[i] = resistance_scores[i] * segment_estimated_times[i]
             
-            if gradient > 0.03:  # Climbing segments
-                # Find this segment in climb info
-                segment_time = distance / max(3.0, 12.0 - gradient * 60)
-                segment_w_budget = w_rate * segment_time if climb_distance > 0 else 0
-                
-                # Calculate sustainable power with W' budget
-                if segment_time > 0 and segment_w_budget > 0:
-                    w_power_contribution = segment_w_budget / segment_time
+            weight_sum = above_cp_weights.sum()
+            if weight_sum > 0:
+                above_cp_weights /= weight_sum  # Normalize to fractions summing to 1
+            
+            # Reserve 20% of W' budget for refinement headroom
+            available_w_budget = target_w_to_use
+            
+            for i in range(num_segments):
+                if above_cp_mask[i]:
+                    # This segment's W' allocation
+                    seg_w_budget = available_w_budget * above_cp_weights[i]
+                    seg_time = segment_estimated_times[i]
+                    
+                    # Convert W' budget to power above CP
+                    w_power_contribution = seg_w_budget / max(seg_time, 1.0)
                     base_power = self.critical_power + w_power_contribution
                     
-                    # Apply conservative limits
-                    max_power = self.critical_power * min(1.5, 1.1 + aggressive_factor * 0.2)  # Much more conservative
+                    # Cap at aggressive_factor-dependent limit
+                    max_power = self.critical_power * min(1.5, 1.0 + aggressive_factor * 0.25)
                     power_strategy[i] = min(base_power, max_power)
                 else:
-                    power_strategy[i] = self.critical_power * 1.05  # Very conservative fallback
-                
-            elif gradient < -0.02:  # Descent segments
-                # Recovery power for descents
-                power_strategy[i] = self.critical_power * 0.7  # Easy recovery
-                
-            else:  # Flat segments
-                # Steady power for flats
-                power_strategy[i] = self.critical_power * 1.02  # Just above CP for sustainability
+                    # Recovery: stay near CP to minimize W' recovery (time-optimal)
+                    # Only go meaningfully below CP on very steep descents where
+                    # you can't physically use the power anyway
+                    recovery_depth = min(abs(gradients[i]) / 0.08, 1.0)  # normalized 0-1
+                    power_strategy[i] = self.critical_power * (0.98 - recovery_depth * 0.10)
+        else:
+            # No segments with positive resistance (unlikely but handle gracefully)
+            # Fall back to uniform CP * 1.02
+            power_strategy[:] = self.critical_power * 1.02
         
         return power_strategy
     
@@ -575,67 +593,102 @@ class CourseOptimizer:
     def _refine_power_strategy(self, course_segments: pd.DataFrame,
                              initial_strategy: np.ndarray,
                              target_w_utilization: float) -> np.ndarray:
-        """Refine power strategy using local optimization."""
+        """Refine power strategy using iterative optimization.
+        
+        Two levers to match target W' utilization:
+        1. Raise/lower above-CP segment power (changes W' depletion rate)
+        2. Raise below-CP segments toward CP (reduces W' recovery)
+        """
         current_strategy = initial_strategy.copy()
+        best_strategy = current_strategy.copy()
+        gradients = course_segments['gradient'].values
         
         # Simulate current strategy
         sim_results = self._simulate_variable_pacing(course_segments, current_strategy)
         current_w_utilization = sim_results['w_utilization']
+        best_w_error = abs(target_w_utilization - current_w_utilization)
         
-        print(f"Optimization converged to {np.mean(current_strategy):.0f}W (target W' utilization: {target_w_utilization*100:.0f}%)")
-        print(f"Achieved W' utilization: {current_w_utilization*100:.1f}% (target: {target_w_utilization*100:.0f}%)")
+        print(f"Initial heuristic: avg {np.mean(current_strategy):.0f}W, "
+              f"W' utilization: {current_w_utilization*100:.1f}% (target: {target_w_utilization*100:.0f}%)")
         
-        # Adjust strategy if W' utilization is off target
-        utilization_error = target_w_utilization - current_w_utilization
-        
-        if abs(utilization_error) > 0.05:  # 5% tolerance
-            # Find climbing segments to adjust
-            climbing_indices = []
-            for i, (_, segment) in enumerate(course_segments.iterrows()):
-                if segment['gradient'] > 0.03:
-                    climbing_indices.append(i)
+        max_iterations = 20
+        for iteration in range(max_iterations):
+            utilization_error = target_w_utilization - current_w_utilization
             
-            if climbing_indices:
-                # If we're using too much W' (current > target), reduce power
-                # If we're using too little W' (current < target), increase power
-                if current_w_utilization > target_w_utilization:                    # Reduce power on climbing segments
-                    reduction_factor = 0.9  # Reduce by 10%
-                    for idx in climbing_indices:
-                        current_strategy[idx] *= reduction_factor
-                        # Keep above minimum threshold
-                        current_strategy[idx] = max(self.critical_power * 1.01, float(current_strategy[idx]))
-                else:
-                    # Increase power on climbing segments (but be careful)
-                    increase_factor = min(1.1, 1.0 + (utilization_error * 0.5))
-                    for idx in climbing_indices:
-                        current_strategy[idx] *= increase_factor
-                        # Keep within reasonable bounds
-                        current_strategy[idx] = min(float(current_strategy[idx]), self.critical_power * 1.5)
+            if abs(utilization_error) <= 0.03:  # 3% tolerance
+                break
+            
+            above_cp_indices = [i for i in range(len(current_strategy)) 
+                               if current_strategy[i] > self.critical_power]
+            below_cp_indices = [i for i in range(len(current_strategy)) 
+                               if current_strategy[i] <= self.critical_power]
+            
+            if not above_cp_indices:
+                # Promote highest-gradient segments to above CP
+                sorted_indices = np.argsort(gradients)[::-1]
+                above_cp_indices = sorted_indices[:max(1, len(sorted_indices) // 2)].tolist()
+            
+            if current_w_utilization < target_w_utilization:
+                # Need MORE W' usage — two strategies:
+                # a) Increase above-CP segment power (more depletion)
+                scale = min(1.10, 1.0 + utilization_error * 0.3)
+                for idx in above_cp_indices:
+                    current_strategy[idx] *= scale
+                    current_strategy[idx] = min(float(current_strategy[idx]), self.critical_power * 1.5)
                 
-                # Re-simulate to check if we improved
-                new_sim_results = self._simulate_variable_pacing(course_segments, current_strategy)
-                new_w_utilization = new_sim_results['w_utilization']
-                
-                # If the adjustment made things worse or infeasible, revert to original
-                if not new_sim_results['feasible'] or abs(new_w_utilization - target_w_utilization) > abs(current_w_utilization - target_w_utilization):
-                    current_strategy = initial_strategy.copy()
-                    print(f"Refinement made results worse, reverting to initial strategy")
-                else:
-                    print(f"Refined W' utilization: {new_w_utilization*100:.1f}%")
+                # b) Raise below-CP segments toward CP (less recovery)
+                if below_cp_indices:
+                    for idx in below_cp_indices:
+                        gap_to_cp = self.critical_power - current_strategy[idx]
+                        # Close 30% of the gap to CP each iteration
+                        current_strategy[idx] += gap_to_cp * 0.30
+                        # Don't exceed CP for recovery segments
+                        current_strategy[idx] = min(float(current_strategy[idx]), self.critical_power * 0.99)
+            else:
+                # Need LESS W' usage — reduce above-CP power
+                scale = max(0.92, 1.0 - abs(utilization_error) * 0.3)
+                for idx in above_cp_indices:
+                    current_strategy[idx] *= scale
+                    current_strategy[idx] = max(self.critical_power * 1.01, float(current_strategy[idx]))
+            
+            # Re-simulate
+            new_sim_results = self._simulate_variable_pacing(course_segments, current_strategy)
+            new_w_utilization = new_sim_results['w_utilization']
+            new_error = abs(target_w_utilization - new_w_utilization)
+            
+            if new_sim_results['feasible'] and new_error < best_w_error:
+                best_strategy = current_strategy.copy()
+                best_w_error = new_error
+                current_w_utilization = new_w_utilization
+            elif not new_sim_results['feasible']:
+                # Went too far, back off from best
+                current_strategy = best_strategy.copy()
+                current_w_utilization = target_w_utilization - best_w_error  # approximate
+                break
         
-        return current_strategy
+        final_sim = self._simulate_variable_pacing(course_segments, best_strategy)
+        print(f"Refined in {iteration+1} iterations: avg {np.mean(best_strategy):.0f}W, "
+              f"W' utilization: {final_sim['w_utilization']*100:.1f}% (target: {target_w_utilization*100:.0f}%)")
+        
+        return best_strategy
     
     def _generate_conservative_strategy(self, course_segments: pd.DataFrame) -> np.ndarray:
         """Generate conservative power strategy as fallback."""
         num_segments = len(course_segments)
-        conservative_strategy = np.full(num_segments, self.critical_power * 1.02)
+        conservative_strategy = np.full(num_segments, self.critical_power)
         
-        # Slightly reduce power on steep climbs to ensure sustainability
+        # Scale power continuously with gradient: more on uphills, less on downhills
         for i, (_, segment) in enumerate(course_segments.iterrows()):
-            if segment['gradient'] > 0.05:  # Steep climbs
-                conservative_strategy[i] = self.critical_power * 0.98
-            elif segment['gradient'] < -0.02:  # Descents
-                conservative_strategy[i] = self.critical_power * 0.8  # Recovery
+            g = segment['gradient']
+            if g > 0:
+                # Slightly above CP, proportional to gradient
+                conservative_strategy[i] = self.critical_power * (1.0 + min(g * 3, 0.1))
+            elif g < -0.01:
+                # Recovery, deeper for steeper descents
+                recovery_depth = min(abs(g) / 0.05, 1.0)
+                conservative_strategy[i] = self.critical_power * (0.9 - recovery_depth * 0.1)
+        
+        return conservative_strategy
         
         return conservative_strategy
     
@@ -843,7 +896,10 @@ class CourseOptimizer:
         if total_points <= target_resolution:
             # No downsampling needed
             print(f"Course has {total_points} points, using all points (target: {target_resolution})")
-            return df.reset_index(drop=True)
+            result_df = df.reset_index(drop=True)
+            # Still need to normalize gradients even without downsampling
+            result_df = self._normalize_gradients(result_df)
+            return result_df
         
         # Calculate basic sampling ratio
         base_ratio = total_points / target_resolution
@@ -905,29 +961,97 @@ class CourseOptimizer:
         # Recalculate cumulative distance and other derived metrics
         smoothed_df['distance'] = smoothed_df['cumulative_distance'].diff().fillna(0)
         
+        # Normalize gradients
+        smoothed_df = self._normalize_gradients(smoothed_df)
+        
         print(f"Downsampled from {total_points} to {len(smoothed_df)} points ({len(smoothed_df)/total_points*100:.1f}%)")
         
         return smoothed_df
+    
+    def _normalize_gradients(self, df: pd.DataFrame) -> pd.DataFrame:
+        """
+        Normalize gradient values to decimal form and clip outliers.
+        
+        Handles inconsistent gradient data:
+        - If max |gradient| > 1.0, assumes percentage format (5.0 = 5%) and divides by 100
+        - Clips to realistic range (-0.5 to 0.5, i.e. -50% to +50%)
+        - Uses gradient_smoothed column if available for better quality
+        
+        Args:
+            df: DataFrame with 'gradient' column
+            
+        Returns:
+            DataFrame with normalized gradient column
+        """
+        if 'gradient' not in df.columns:
+            return df
+        
+        df = df.copy()
+        
+        # Prefer gradient_smoothed if available (less noisy)
+        if 'gradient_smoothed' in df.columns:
+            source_col = 'gradient_smoothed'
+        else:
+            source_col = 'gradient'
+        
+        grad_values = df[source_col].copy()
+        
+        # Detect format: if many values > 1.0, it's percentage format
+        pct_above_1 = (grad_values.abs() > 1.0).mean()
+        grad_max = grad_values.abs().max()
+        
+        if grad_max > 1.0 and pct_above_1 > 0.05:
+            # Percentage format (5.0 = 5%) → convert to decimal (0.05)
+            grad_values = grad_values / 100
+            print(f"Normalized gradient from percentage to decimal (max was {grad_max:.1f}%, {pct_above_1*100:.0f}% of points > 1.0)")
+        elif grad_max > 1.0:
+            # Mostly decimal but with outliers — just clip
+            print(f"Gradient appears decimal with outliers (max={grad_max:.2f}, only {pct_above_1*100:.1f}% > 1.0)")
+        
+        # Clip to realistic range (-50% to +50%)
+        grad_values = grad_values.clip(-0.5, 0.5)
+        
+        df['gradient'] = grad_values
+        
+        return df
     
     def _assign_points_to_segments(self, high_res_points: pd.DataFrame, 
                                  course_segments: pd.DataFrame) -> np.ndarray:
         """
         Assign each high-resolution point to the appropriate course segment.
         
+        Uses the original segment labels from the course data when available,
+        since segments from clustering/auto_segmentation are non-contiguous
+        (points with similar gradients are grouped together regardless of position).
+        
         Args:
-            high_res_points: High-resolution course points
+            high_res_points: High-resolution course points (from _smooth_course_to_resolution)
             course_segments: Course segments with distance ranges
             
         Returns:
             Array mapping each point to segment index
         """
-        # Ensure cumulative_distance exists
+        # Preferred approach: use original segment column from course data
+        # This correctly handles non-contiguous segments from clustering/auto_segmentation
+        if 'segment' in high_res_points.columns:
+            segment_values = high_res_points['segment'].values
+            # Validate that segment IDs match course_segments index
+            valid_seg_ids = set(course_segments.index)
+            if set(np.unique(segment_values[~np.isnan(segment_values)])).issubset(valid_seg_ids) or \
+               set(np.unique(segment_values[~np.isnan(segment_values)])) == valid_seg_ids:
+                print(f"Using original segment labels from course data ({len(valid_seg_ids)} segments)")
+                return segment_values.astype(int)
+            else:
+                print(f"Warning: segment column IDs {set(np.unique(segment_values))} don't match "
+                      f"course_segments index {valid_seg_ids}, falling back to distance-based mapping")
+        
+        # Fallback: distance-based mapping for contiguous segments
+        # (e.g., equal segmentation where segments ARE contiguous)
         if 'cumulative_distance' not in high_res_points.columns:
             if 'distance' in high_res_points.columns:
                 high_res_points = high_res_points.copy()
                 high_res_points['cumulative_distance'] = high_res_points['distance'].cumsum()
             else:
-                # Fallback: evenly distribute points across segments
                 num_points = len(high_res_points)
                 num_segments = len(course_segments)
                 return np.repeat(np.arange(num_segments), num_points // num_segments + 1)[:num_points]
@@ -935,39 +1059,32 @@ class CourseOptimizer:
         point_distances = high_res_points['cumulative_distance'] / 1000  # Convert to km
         segment_mapping = np.zeros(len(high_res_points), dtype=int)
         
-        # Check if enhanced segmentation format is available
         if 'start_distance' in course_segments.columns and 'end_distance' in course_segments.columns:
-            # Use precise distance mapping from enhanced format
             for i, distance in enumerate(point_distances):
-                # Find which segment this distance falls into
                 for seg_idx, segment in course_segments.iterrows():
-                    start_dist = segment['start_distance'] / 1000  # Convert to km
-                    end_dist = segment['end_distance'] / 1000      # Convert to km
-                    
+                    start_dist = segment['start_distance'] / 1000
+                    end_dist = segment['end_distance'] / 1000
                     if start_dist <= distance <= end_dist:
                         segment_mapping[i] = seg_idx
                         break
                 else:
-                    # Fallback to closest segment if no exact match
-                    segment_centers = (course_segments.get('start_distance', 0) + course_segments.get('end_distance', 0)) / 2000  # km
+                    segment_centers = (course_segments.get('start_distance', 0) + course_segments.get('end_distance', 0)) / 2000
                     closest_seg = (segment_centers - distance).abs().idxmin()
                     segment_mapping[i] = closest_seg
         else:
-            # Traditional approach - distribute points evenly across segments
             total_distance = point_distances.iloc[-1]
             cumulative_segment_distance = 0
+            dist_col = 'distance' if 'distance' in course_segments.columns else 'distance_sum'
             
             for seg_idx, segment in course_segments.iterrows():
-                segment_distance = segment['distance'] / 1000  # Convert to km
+                segment_distance = segment[dist_col]
+                if dist_col == 'distance':
+                    segment_distance = segment_distance / 1000
                 segment_end = cumulative_segment_distance + segment_distance
-                
-                # Assign points that fall within this segment's distance range
                 mask = (point_distances >= cumulative_segment_distance) & (point_distances < segment_end)
                 segment_mapping[mask] = seg_idx
-                
                 cumulative_segment_distance = segment_end
             
-            # Handle last segment edge case
             segment_mapping[point_distances >= cumulative_segment_distance] = len(course_segments) - 1
         
         return segment_mapping
@@ -1090,7 +1207,7 @@ class CourseOptimizer:
         try:
             initial_speed_calc = calculate_speed_and_plot(
                 avg_power, 
-                gradient=high_res_points['gradient'].iloc[0] / 100,  # Convert to decimal
+                gradient=high_res_points['gradient'].iloc[0],  # Already in decimal form from smoothing
                 v_wind=0, 
                 altitude=high_res_points['altitude'].iloc[0]
             )
@@ -1102,7 +1219,7 @@ class CourseOptimizer:
         
         for i in range(num_points):
             power = point_powers[i]
-            gradient = high_res_points['gradient'].iloc[i] / 100  # Convert to decimal
+            gradient = high_res_points['gradient'].iloc[i]  # Already in decimal form from smoothing
             altitude = high_res_points['altitude'].iloc[i]
             
             if i == 0:

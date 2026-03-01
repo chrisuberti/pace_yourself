@@ -16,6 +16,43 @@ import sys
 sys.path.append(os.path.dirname(__file__))
 
 from cycling_physics import calculate_speed_and_plot
+from rider import calculate_w_prime_recovery, WTankCalculator
+
+
+def _has_cluster_info(course_segments: pd.DataFrame) -> bool:
+    """Check whether segments carry cluster/segment_id metadata."""
+    return 'segment_id' in course_segments.columns
+
+
+def _expand_cluster_powers(cluster_power_map: Dict[int, float],
+                           segment_ids: pd.Series) -> np.ndarray:
+    """Convert a {cluster_id: power} map to a per-segment power array.
+    
+    Every segment with the *same* segment_id gets the *same* power value.
+    This is the core mechanic that gives riders a simple instruction set:
+    "uphills: 330 W, flats: 290 W, descents: 250 W".
+    
+    Args:
+        cluster_power_map: Dict mapping cluster/segment_id → power (watts).
+        segment_ids: Series of segment_id values (one per spatial segment).
+    
+    Returns:
+        np.ndarray of power values aligned to segment order.
+    """
+    return np.array([cluster_power_map[sid] for sid in segment_ids])
+
+
+def _cluster_power_map_from_array(power_array: np.ndarray,
+                                  segment_ids: pd.Series) -> Dict[int, float]:
+    """Inverse of _expand_cluster_powers — take per-segment array, pick
+    the first power value for each cluster_id (they should all be the same
+    within a cluster, but just in case we take the mean).
+    """
+    mapping: Dict[int, float] = {}
+    for sid in segment_ids.unique():
+        mask = segment_ids == sid
+        mapping[sid] = float(np.mean(power_array[mask]))
+    return mapping
 
 
 class CourseOptimizer:
@@ -24,18 +61,77 @@ class CourseOptimizer:
     
     This class provides methods to simulate course performance and optimize
     pacing strategies based on rider physiology and course characteristics.
+    
+    Supports efforts from short (< 1 hour, W'-driven) to long (up to 4 hours,
+    endurance-decay-driven) via the piecewise power-duration model.
     """
     
-    def __init__(self, critical_power: float, w_prime: float):
+    def __init__(self, critical_power: float, w_prime: float,
+                 endurance_fatigue_k: float = 0.05):
         """
         Initialize course optimizer with rider parameters.
         
         Args:
             critical_power: Rider's critical power (W)
             w_prime: Rider's anaerobic capacity (J)
+            endurance_fatigue_k: Endurance fatigue exponent for efforts > 1 hour.
+                Typical values: 0.04 (endurance specialist) to 0.07 (sprinter).
+                Default 0.05 (all-rounder).
         """
         self.critical_power = critical_power
         self.w_prime = w_prime
+        self.endurance_k = endurance_fatigue_k
+
+    def max_sustainable_power_for_duration(self, duration_seconds: float) -> float:
+        """Return the maximum sustainable average power for a given duration.
+        
+        Uses the piecewise model:
+          t ≤ 3600s: P = CP + W'/t
+          t > 3600s: P = CP × (3600/t)^k
+        
+        This is the power ceiling — the rider cannot average more than this
+        over the given duration without exhausting physiological reserves.
+        """
+        return float(WTankCalculator.piecewise_power_duration(
+            duration_seconds, self.critical_power, self.w_prime, self.endurance_k))
+
+    def _estimate_course_duration(self, course_segments: pd.DataFrame,
+                                   power_guess: float = None) -> float:
+        """Rough estimate of total course duration at a reference power.
+        
+        Used to determine whether this is a short (< 1h) or long (> 1h) effort,
+        which changes the optimization strategy.
+        
+        Args:
+            course_segments: Normalized segments DataFrame.
+            power_guess: Power to estimate at. If None, uses CP.
+        
+        Returns:
+            Estimated duration in seconds.
+        """
+        if power_guess is None:
+            power_guess = self.critical_power
+        
+        total_time = 0
+        for _, seg in course_segments.iterrows():
+            gradient = seg['gradient']
+            distance = seg['distance']
+            wind = seg.get('wind', 0)
+            altitude = seg.get('altitude', 0)
+            try:
+                sc = calculate_speed_and_plot(
+                    power_guess, gradient=gradient, v_wind=wind, altitude=altitude)
+                speed = sc['speed_mps']
+            except Exception:
+                speed = max(3.0, min(20.0, power_guess / 200.0))
+            total_time += distance / max(speed, 1.0)
+        return total_time
+
+    def is_long_effort(self, course_segments: pd.DataFrame) -> bool:
+        """Return True if estimated duration at CP exceeds 1 hour."""
+        segments = self._normalize_segments(course_segments)
+        est = self._estimate_course_duration(segments)
+        return est > 3600
     
     def _normalize_segments(self, course_segments: pd.DataFrame) -> pd.DataFrame:
         """
@@ -174,9 +270,15 @@ class CourseOptimizer:
                 if w_remaining < 0:
                     return pd.DataFrame(results), float('inf'), w_remaining, total_energy_used
             else:
-                # Recovery below critical power
-                w_recovery = (self.critical_power - power) * time
-                w_remaining = min(w_remaining + w_recovery, self.w_prime)
+                # Exponential recovery below critical power (Skiba model)
+                # Recovery is much slower than depletion — prevents perpetual W' recycling
+                w_remaining = calculate_w_prime_recovery(
+                    W_prime_max=self.w_prime,
+                    W_prime_current=w_remaining,
+                    CP=self.critical_power,
+                    P_recovery=power,
+                    recovery_time=time
+                )
             
             # Track total energy expenditure
             total_energy_used += power * time
@@ -233,7 +335,7 @@ class CourseOptimizer:
                 w_utilization = w_used / self.w_prime
                 
                 # Strong penalty for not using enough W' (undertrained) or using too much (unsustainable)
-                w_penalty = abs(w_utilization - target_w_utilization) * total_time * 0.1
+                w_penalty = abs(w_utilization - target_w_utilization) * total_time * w_penalty_weight
                 
                 # Heavily penalize finishing with too much W' remaining (inefficient)
                 if w_utilization < target_w_utilization * 0.7:  # Less than 70% of target
@@ -245,13 +347,31 @@ class CourseOptimizer:
             except Exception as e:
                 print(f"Warning: Optimization objective failed at power {power}: {e}")
                 return 1e6 + (power - self.critical_power) ** 2        
-        # Set more conservative optimization bounds to avoid numerical issues
-        lower_bound = max(self.critical_power * 0.9, 150)  # More conservative lower bound
-        upper_bound = min(self.critical_power * 2.0, 500)  # More conservative upper bound
+        # Set optimization bounds based on estimated effort duration.
+        # For short efforts (<1h), power is above CP.
+        # For long efforts (>1h), optimal constant power may be below CP.
+        segments_norm = self._normalize_segments(course_segments)
+        est_duration = self._estimate_course_duration(segments_norm)
+        power_ceiling = self.max_sustainable_power_for_duration(est_duration)
+        
+        if est_duration > 3600:
+            # Long effort: allow sub-CP power down to the 4-hour ceiling
+            floor_power = self.max_sustainable_power_for_duration(14400)  # 4h floor
+            lower_bound = max(floor_power * 0.95, 100)
+            upper_bound = min(self.critical_power * 1.5, 600)
+            # For long efforts, reduce W' penalty weight (W' less relevant)
+            w_penalty_weight = max(0.02, 0.1 * (3600 / est_duration))
+            print(f"Long effort detected: est. {est_duration/60:.0f} min, "
+                  f"power ceiling {power_ceiling:.0f}W, bounds [{lower_bound:.0f}, {upper_bound:.0f}]")
+        else:
+            lower_bound = max(self.critical_power * 0.9, 150)
+            upper_bound = min(self.critical_power * 2.0, 500)
+            w_penalty_weight = 0.1
+        
         bounds = [(lower_bound, upper_bound)]
         
         # Start optimization from a reasonable power level
-        initial_power = min(self.critical_power * 1.2, upper_bound)
+        initial_power = min(power_ceiling * 1.02, upper_bound)
         
         try:
             # Run optimization with multiple starting points to avoid local minima
@@ -259,11 +379,19 @@ class CourseOptimizer:
             best_objective = float('inf')
             
             # Try multiple starting points within reasonable range
-            start_powers = [
-                max(self.critical_power * 1.05, lower_bound),  # Just above CP
-                min(self.critical_power * 1.2, upper_bound),   # Moderate
-                min(self.critical_power * 1.4, upper_bound),   # Aggressive
-            ]
+            if est_duration > 3600:
+                # Long effort: search around and below CP
+                start_powers = [
+                    max(power_ceiling * 0.98, lower_bound),      # Just below ceiling
+                    max(self.critical_power * 0.95, lower_bound), # Sub-CP
+                    min(self.critical_power * 1.05, upper_bound), # Just above CP
+                ]
+            else:
+                start_powers = [
+                    max(self.critical_power * 1.05, lower_bound),  # Just above CP
+                    min(self.critical_power * 1.2, upper_bound),   # Moderate
+                    min(self.critical_power * 1.4, upper_bound),   # Aggressive
+                ]
             
             for start_power in start_powers:
                 if lower_bound <= start_power <= upper_bound:
@@ -371,10 +499,18 @@ class CourseOptimizer:
             )
             final_results = self._simulate_variable_pacing(course_segments, optimized_strategy)
         else:
-            # Fallback to more conservative strategy
+            # Fallback to more conservative strategy, then refine
             print("Initial strategy infeasible, using conservative fallback")
             conservative_strategy = self._generate_conservative_strategy(course_segments)
-            optimized_strategy = conservative_strategy
+            conservative_sim = self._simulate_variable_pacing(
+                course_segments, conservative_strategy)
+            if conservative_sim['feasible']:
+                optimized_strategy = self._refine_power_strategy(
+                    course_segments, conservative_strategy, target_w_utilization)
+            else:
+                # Even conservative is infeasible — clamp to flat CP
+                optimized_strategy = np.full(len(course_segments),
+                                             self.critical_power)
             final_results = self._simulate_variable_pacing(course_segments, optimized_strategy)
         
         # Step 5: Create detailed results DataFrame
@@ -430,86 +566,262 @@ class CourseOptimizer:
                                          target_w_utilization: float,
                                          aggressive_factor: float) -> np.ndarray:
         """
-        Generate initial power strategy using continuous gradient-based scaling.
+        Generate initial power strategy using per-cluster-type power assignment.
         
-        Instead of hard terrain thresholds (which fail with averaged gradients from 
-        equal segmentation), this uses a continuous mapping from gradient to power.
-        The physics principle: extra watts save more time on uphills (high resistance)
-        than on flats/descents, so allocate power proportionally to resistance.
+        When segments carry a segment_id (from clustering or terrain segmentation),
+        every segment of the same type gets the *same* power value.  This makes the
+        rider's instructions simple: "Cluster 1 (uphills): 330 W, Cluster 2 (flats):
+        290 W, …".
+        
+        For legacy (equal) segmentation without segment_id the old continuous
+        gradient-based approach is used as a fallback.
+        """
+        num_segments = len(course_segments)
+        gradients = course_segments['gradient'].values
+        distances = course_segments['distance'].values
+
+        # Target W' budget
+        target_w_to_use = self.w_prime * target_w_utilization
+
+        # ---------- Cluster-aware path ----------
+        if _has_cluster_info(course_segments):
+            return self._generate_cluster_heuristic(
+                course_segments, target_w_to_use, aggressive_factor)
+
+        # ---------- Legacy per-segment fallback (equal segmentation) ----------
+        return self._generate_per_segment_heuristic(
+            course_segments, target_w_to_use, aggressive_factor)
+
+    # ------------------------------------------------------------------ #
+    #  Cluster-aware heuristic (NEW)                                       #
+    # ------------------------------------------------------------------ #
+    def _generate_cluster_heuristic(self, course_segments: pd.DataFrame,
+                                    target_w_to_use: float,
+                                    aggressive_factor: float) -> np.ndarray:
+        """Per-cluster-type power assignment.
+        
+        Duration-aware: for long efforts (>1h), scales base power below CP
+        using the piecewise power-duration ceiling.  W' budget is only spent
+        on steep climb clusters where the time savings are greatest.
+        """
+        segment_ids = course_segments['segment_id']
+        gradients = course_segments['gradient'].values
+        distances = course_segments['distance'].values
+
+        # Estimate effort duration to determine short vs long regime
+        est_duration = self._estimate_course_duration(course_segments)
+        is_long = est_duration > 3600
+        # For long efforts, base_power drops below CP via piecewise model.
+        # For short efforts, base remains CP — W' budget is layered on top.
+        if is_long:
+            base_power = self.max_sustainable_power_for_duration(est_duration)
+        else:
+            base_power = self.critical_power
+
+        if is_long:
+            print(f"Long-effort heuristic: est. {est_duration/60:.0f} min, "
+                  f"base power {base_power:.0f} W (CP={self.critical_power:.0f})")
+
+        # Per-cluster stats
+        cluster_stats: Dict[int, Dict[str, float]] = {}
+        for cid in segment_ids.unique():
+            mask = segment_ids == cid
+            c_grads = gradients[mask]
+            c_dists = distances[mask]
+            mean_grad = float(np.mean(c_grads))
+            total_dist = float(np.sum(c_dists))
+            # Rough time estimate at base power
+            est_speed = max(3.0, 12.0 - mean_grad * 80)
+            est_time = total_dist / est_speed
+            cluster_stats[cid] = {
+                'mean_gradient': mean_grad,
+                'total_distance': total_dist,
+                'est_time': est_time,
+            }
+
+        # ---------- RELATIVE gradient classification ----------
+        # The key constraint: W' recovery requires power *meaningfully* below
+        # CP (Skiba model: tau = 2287 * DCP^-0.69, so DCP < 15 W → tau > 300 s
+        # → negligible recovery).  We therefore need enough course distance in
+        # recovery clusters, with power far enough below CP, for the depletion/
+        # recovery cycle to actually work.  Target: ≥ 35-40 % of clusters as
+        # recovery.
+        cluster_grads = np.array([v['mean_gradient'] for v in cluster_stats.values()])
+        cluster_ids_sorted = sorted(cluster_stats, key=lambda k: cluster_stats[k]['mean_gradient'])
+        grad_range = float(cluster_grads.max() - cluster_grads.min())
+
+        # Always use a relative (median-based) threshold to guarantee a
+        # meaningful effort/recovery split regardless of absolute gradients.
+        # On truly flat courses grad_range ≈ 0, but the median still splits
+        # clusters into halves which is the best we can do.
+        if len(cluster_grads) >= 2:
+            median_grad = float(np.median(cluster_grads))
+            # For long efforts, bias effort threshold slightly above median
+            # so only the steepest clusters get W' budget
+            if is_long:
+                effort_threshold = max(median_grad + 0.005, 0.02)
+            else:
+                effort_threshold = median_grad
+        else:
+            effort_threshold = 0.0 if not is_long else 0.02
+
+        effort_clusters = {k: v for k, v in cluster_stats.items()
+                          if v['mean_gradient'] > effort_threshold}
+        recovery_clusters = {k: v for k, v in cluster_stats.items()
+                            if v['mean_gradient'] <= effort_threshold}
+
+        # Guarantee minimum representation of each type (≥ 35 % of clusters)
+        min_recovery_count = max(1, len(cluster_ids_sorted) * 35 // 100)
+        if len(recovery_clusters) < min_recovery_count and len(cluster_stats) > 1:
+            # Promote the gentlest clusters until we hit the minimum
+            for cid in cluster_ids_sorted:
+                if len(recovery_clusters) >= min_recovery_count:
+                    break
+                if cid not in recovery_clusters:
+                    recovery_clusters[cid] = cluster_stats[cid]
+                    effort_clusters.pop(cid, None)
+        if not effort_clusters and len(cluster_stats) > 1:
+            steepest = cluster_ids_sorted[-1]
+            effort_clusters[steepest] = cluster_stats[steepest]
+            recovery_clusters.pop(steepest, None)
+
+        # Scale W' budget by terrain variation — when all clusters have similar
+        # gradients, variable pacing offers diminishing returns over constant.
+        # grad_range ~0 ⇒ factor ~0.3, grad_range ≥ 0.06 ⇒ factor = 1.0
+        terrain_variation_factor = min(1.0, 0.3 + 0.7 * (grad_range / 0.06))
+        adjusted_w_to_use = target_w_to_use * terrain_variation_factor
+
+        # --- Distribute W' across effort clusters weighted by gradient × time ---
+        effort_weights = {}
+        for cid, stats in effort_clusters.items():
+            resistance = stats['mean_gradient'] + 0.01
+            effort_weights[cid] = max(resistance, 0.001) * stats['est_time']
+        weight_sum = sum(effort_weights.values()) or 1.0
+
+        # Power limits — tighter for long efforts
+        if is_long:
+            max_power = self.critical_power * min(1.4, 1.0 + aggressive_factor * 0.2)
+            min_recovery = base_power * 0.70
+        else:
+            max_power = self.critical_power * min(1.8, 1.0 + aggressive_factor * 0.35)
+            # Recovery must be far enough below CP for Skiba W' recovery to
+            # work: at CP*0.85, DCP≈45 W → tau≈140 s, reasonable recovery.
+            # Previous 0.85 floor was the *assignment*, not the floor.
+            min_recovery = self.critical_power * 0.65
+
+        cluster_power_map: Dict[int, float] = {}
+
+        for cid, stats in effort_clusters.items():
+            frac = effort_weights[cid] / weight_sum
+            w_budget = adjusted_w_to_use * frac
+            w_contribution = w_budget / max(stats['est_time'], 1.0)
+            power = base_power + w_contribution
+            cluster_power_map[cid] = min(power, max_power)
+
+        for cid, stats in recovery_clusters.items():
+            mean_grad = stats['mean_gradient']
+            if mean_grad > 0.01:
+                # Uphill recovery: still need meaningful DCP for W' recovery.
+                # At CP*0.90, DCP≈30 W → tau≈190 s — decent recovery while
+                # limiting time loss on the climb.
+                if is_long:
+                    power = base_power * 0.92
+                else:
+                    power = self.critical_power * 0.88
+            elif mean_grad < -0.02:
+                # Downhill: speed is high anyway, so deep recovery is cheap
+                # in time cost but very effective for W' recharge.
+                depth = min(abs(mean_grad) / 0.08, 1.0)
+                if is_long:
+                    power = base_power * (0.88 - depth * 0.18)
+                else:
+                    power = self.critical_power * (0.82 - depth * 0.17)
+            else:
+                # Flat / false-flat: moderate-deep recovery
+                if is_long:
+                    power = base_power * 0.90
+                else:
+                    power = self.critical_power * 0.85
+            cluster_power_map[cid] = max(power, min_recovery)
+
+        print(f"Cluster heuristic — {len(effort_clusters)} effort / "
+              f"{len(recovery_clusters)} recovery clusters "
+              f"(terrain variation: {terrain_variation_factor:.0%}, "
+              f"W' budget: {adjusted_w_to_use:.0f}J of {target_w_to_use:.0f}J)")
+        for cid in sorted(cluster_power_map):
+            g = cluster_stats[cid]['mean_gradient']
+            p = cluster_power_map[cid]
+            label = "effort" if cid in effort_clusters else "recovery"
+            print(f"  Cluster {cid} ({label}, grad={g*100:.1f}%): {p:.0f} W")
+
+        return _expand_cluster_powers(cluster_power_map, segment_ids)
+
+    # ------------------------------------------------------------------ #
+    #  Legacy per-segment heuristic (unchanged logic, extracted)            #
+    # ------------------------------------------------------------------ #
+    def _generate_per_segment_heuristic(self, course_segments: pd.DataFrame,
+                                        target_w_to_use: float,
+                                        aggressive_factor: float) -> np.ndarray:
+        """Gradient-based continuous power mapping for equal-segment mode.
+
+        Duration-aware: for long efforts (> 1 h), base power drops below CP
+        following the piecewise power-duration model and W' budget is allocated
+        more conservatively (only steep climbs warrant above-CP surges).
         """
         num_segments = len(course_segments)
         power_strategy = np.zeros(num_segments)
-        
-        # Target W' budget
-        target_w_to_use = self.w_prime * target_w_utilization
-        
         gradients = course_segments['gradient'].values
         distances = course_segments['distance'].values
+
+        # --- Duration awareness ---
+        est_duration = self._estimate_course_duration(course_segments)
+        is_long = est_duration > 3600
+        base_power = (self.max_sustainable_power_for_duration(est_duration)
+                      if is_long else self.critical_power)
+
+        resistance_scores = gradients + 0.01
+        # Long efforts: only truly steep segments get W' budget
+        effort_threshold = 0.02 if is_long else 0.0
+        above_cp_mask = resistance_scores > effort_threshold
         
-        # Compute a "resistance score" for each segment: higher = harder = more power needed
-        # Use gradient as the primary driver, with a baseline offset so even flat segments
-        # participate in the optimization (just less so)
-        resistance_scores = np.zeros(num_segments)
-        for i in range(num_segments):
-            g = gradients[i]
-            # Continuous score: positive gradient → high resistance, negative → low
-            # Shift so that gradient=0 gets a small positive score (still worth some effort)
-            resistance_scores[i] = g + 0.01  # offset so flat is slightly positive
-        
-        # Separate into segments that should get above-CP power (positive resistance)
-        # and segments that should recover (negative resistance)
-        above_cp_mask = resistance_scores > 0
-        below_cp_mask = ~above_cp_mask
-        
-        # Estimate total time at CP to budget W' distribution
-        total_above_cp_time = 0
         segment_estimated_times = np.zeros(num_segments)
         for i in range(num_segments):
-            # Rough speed estimate at CP
-            estimated_speed = max(3.0, 12.0 - gradients[i] * 80)
-            segment_estimated_times[i] = distances[i] / estimated_speed
-            if above_cp_mask[i]:
-                total_above_cp_time += segment_estimated_times[i]
-        
+            est_speed = max(3.0, 12.0 - gradients[i] * 80)
+            segment_estimated_times[i] = distances[i] / est_speed
+
+        total_above_cp_time = segment_estimated_times[above_cp_mask].sum()
+
+        if is_long:
+            max_power = self.critical_power * min(1.4, 1.0 + aggressive_factor * 0.20)
+        else:
+            max_power = self.critical_power * min(1.5, 1.0 + aggressive_factor * 0.25)
+
         if total_above_cp_time > 0:
-            # Distribute W' budget weighted by resistance × time
-            # Higher resistance segments get more of the W' pie
-            above_cp_weights = np.zeros(num_segments)
-            for i in range(num_segments):
-                if above_cp_mask[i]:
-                    above_cp_weights[i] = resistance_scores[i] * segment_estimated_times[i]
-            
+            above_cp_weights = np.where(
+                above_cp_mask,
+                resistance_scores * segment_estimated_times, 0.0)
             weight_sum = above_cp_weights.sum()
             if weight_sum > 0:
-                above_cp_weights /= weight_sum  # Normalize to fractions summing to 1
-            
-            # Reserve 20% of W' budget for refinement headroom
-            available_w_budget = target_w_to_use
-            
+                above_cp_weights /= weight_sum
+
             for i in range(num_segments):
                 if above_cp_mask[i]:
-                    # This segment's W' allocation
-                    seg_w_budget = available_w_budget * above_cp_weights[i]
+                    seg_w_budget = target_w_to_use * above_cp_weights[i]
                     seg_time = segment_estimated_times[i]
-                    
-                    # Convert W' budget to power above CP
-                    w_power_contribution = seg_w_budget / max(seg_time, 1.0)
-                    base_power = self.critical_power + w_power_contribution
-                    
-                    # Cap at aggressive_factor-dependent limit
-                    max_power = self.critical_power * min(1.5, 1.0 + aggressive_factor * 0.25)
-                    power_strategy[i] = min(base_power, max_power)
+                    w_contribution = seg_w_budget / max(seg_time, 1.0)
+                    seg_power = base_power + w_contribution
+                    power_strategy[i] = min(seg_power, max_power)
                 else:
-                    # Recovery: stay near CP to minimize W' recovery (time-optimal)
-                    # Only go meaningfully below CP on very steep descents where
-                    # you can't physically use the power anyway
-                    recovery_depth = min(abs(gradients[i]) / 0.08, 1.0)  # normalized 0-1
-                    power_strategy[i] = self.critical_power * (0.98 - recovery_depth * 0.10)
+                    depth = min(abs(gradients[i]) / 0.08, 1.0)
+                    if is_long:
+                        # Long effort: recover near base_power
+                        power_strategy[i] = base_power * (0.97 - depth * 0.15)
+                    else:
+                        # Keep recovery near CP (0.88-0.98×CP) for per-segment mode
+                        power_strategy[i] = self.critical_power * (0.98 - depth * 0.10)
         else:
-            # No segments with positive resistance (unlikely but handle gracefully)
-            # Fall back to uniform CP * 1.02
-            power_strategy[:] = self.critical_power * 1.02
-        
+            power_strategy[:] = base_power * 1.02
+
         return power_strategy
     
     def _calculate_max_sustainable_power(self, distance: float, gradient: float, 
@@ -564,8 +876,15 @@ class CourseOptimizer:
                     feasible = False
                     # Continue simulation for analysis but mark as infeasible
             else:
-                w_recovery = (self.critical_power - power) * time
-                w_remaining = min(w_remaining + w_recovery, self.w_prime)
+                # Exponential recovery below critical power (Skiba model)
+                # Recovery is much slower than depletion — prevents perpetual W' recycling
+                w_remaining = calculate_w_prime_recovery(
+                    W_prime_max=self.w_prime,
+                    W_prime_current=w_remaining,
+                    CP=self.critical_power,
+                    P_recovery=power,
+                    recovery_time=time
+                )
             
             total_energy_used += power * time
             
@@ -593,78 +912,218 @@ class CourseOptimizer:
     def _refine_power_strategy(self, course_segments: pd.DataFrame,
                              initial_strategy: np.ndarray,
                              target_w_utilization: float) -> np.ndarray:
-        """Refine power strategy using iterative optimization.
+        """Refine power strategy — cluster-aware or per-segment fallback.
         
-        Two levers to match target W' utilization:
-        1. Raise/lower above-CP segment power (changes W' depletion rate)
-        2. Raise below-CP segments toward CP (reduces W' recovery)
+        Cluster-aware: uses scipy.optimize.minimize over N_cluster variables.
+        Legacy: iterative scaling with wider bounds than before.
+        """
+        if _has_cluster_info(course_segments):
+            return self._refine_cluster_strategy(
+                course_segments, initial_strategy, target_w_utilization)
+        return self._refine_per_segment_strategy(
+            course_segments, initial_strategy, target_w_utilization)
+
+    # ------------------------------------------------------------------ #
+    #  Cluster-aware refinement (NEW — scipy minimizer)                    #
+    # ------------------------------------------------------------------ #
+    def _refine_cluster_strategy(self, course_segments: pd.DataFrame,
+                                 initial_strategy: np.ndarray,
+                                 target_w_utilization: float) -> np.ndarray:
+        """Optimise N_cluster power values to minimise total course time.
+        
+        The search space is small (typically 3-6 dimensions), so we can use
+        L-BFGS-B with finite penalties for W' depletion.
+        """
+        segment_ids = course_segments['segment_id']
+        unique_ids = sorted(segment_ids.unique())
+        n_clusters = len(unique_ids)
+        id_to_idx = {cid: i for i, cid in enumerate(unique_ids)}
+
+        # Initial cluster powers from heuristic
+        initial_map = _cluster_power_map_from_array(initial_strategy, segment_ids)
+        x0 = np.array([initial_map[cid] for cid in unique_ids])
+
+        # Bounds per cluster: duration-aware range
+        est_duration = self._estimate_course_duration(course_segments)
+        is_long = est_duration > 3600
+        if is_long:
+            base_power = self.max_sustainable_power_for_duration(est_duration)
+            max_power = self.critical_power * 1.4
+            min_power = base_power * 0.70
+        else:
+            max_power = self.critical_power * 1.8
+            min_power = self.critical_power * 0.55
+        bounds = [(min_power, max_power)] * n_clusters
+
+        best_result = {'time': float('inf'), 'strategy': initial_strategy.copy()}
+
+        def objective(x):
+            cmap = {cid: x[id_to_idx[cid]] for cid in unique_ids}
+            power_array = _expand_cluster_powers(cmap, segment_ids)
+            sim = self._simulate_variable_pacing(course_segments, power_array)
+
+            time = sim['total_time']
+            # Penalise W' depletion (infeasible) with a steep penalty so the
+            # optimizer rapidly backs away from infeasible regions.
+            if not sim['feasible']:
+                deficit = abs(sim['final_w_remaining'])
+                time += 1e6 + deficit * 100
+                return time  # don't update best_result for infeasible
+
+            # Penalty for missing W' target — scale by course time so it's
+            # proportionally significant regardless of course length.
+            w_err = abs(sim['w_utilization'] - target_w_utilization)
+            time += w_err * max(100, time * 0.3)  # ~30% of course time per unit error
+
+            # Diversity incentive: penalise strategies where all cluster
+            # powers converge to the same value (defeats purpose of variable
+            # pacing).  This nudges the optimizer to maintain meaningful
+            # separation between effort and recovery clusters.
+            if n_clusters >= 2:
+                power_values = np.array([x[id_to_idx[cid]] for cid in unique_ids])
+                power_range = power_values.max() - power_values.min()
+                if power_range < 20:
+                    time += (20 - power_range) * 3
+
+            if time < best_result['time']:
+                best_result['time'] = time
+                best_result['strategy'] = power_array.copy()
+
+            return time
+
+        # Multi-start: original + jittered + spread variants
+        from scipy.optimize import minimize as sp_minimize
+        starts = [x0]
+        rng = np.random.default_rng(42)
+        for _ in range(3):
+            jitter = x0 + rng.normal(0, self.critical_power * 0.05, n_clusters)
+            jitter = np.clip(jitter, min_power, max_power)
+            starts.append(jitter)
+
+        # Add a "spread" start that exaggerates the heuristic differences.
+        # This helps escape the local minimum where all clusters converge.
+        if n_clusters >= 2:
+            mean_x0 = np.mean(x0)
+            spread_start = mean_x0 + (x0 - mean_x0) * 1.5
+            spread_start = np.clip(spread_start, min_power, max_power)
+            starts.append(spread_start)
+
+        for start in starts:
+            try:
+                sp_minimize(objective, start, method='L-BFGS-B',
+                            bounds=bounds, options={'maxiter': 60, 'ftol': 0.1})
+            except Exception:
+                pass  # best_result updated via side effect
+
+        # Log final cluster powers
+        final_map = _cluster_power_map_from_array(best_result['strategy'], segment_ids)
+        sim = self._simulate_variable_pacing(course_segments, best_result['strategy'])
+        print(f"Cluster refinement → {sim['total_time']/60:.1f} min, "
+              f"W' util: {sim['w_utilization']*100:.1f}%")
+        for cid in unique_ids:
+            print(f"  Cluster {cid}: {final_map[cid]:.0f} W")
+
+        return best_result['strategy']
+
+    # ------------------------------------------------------------------ #
+    #  Legacy per-segment refinement (kept for equal-segment mode)          #
+    # ------------------------------------------------------------------ #
+    def _refine_per_segment_strategy(self, course_segments: pd.DataFrame,
+                                     initial_strategy: np.ndarray,
+                                     target_w_utilization: float) -> np.ndarray:
+        """Iterative per-segment refinement with wider dynamic range.
+
+        Duration-aware: long efforts use sub-CP base power, tighter bounds,
+        and recovery targets near the piecewise-model ceiling rather than CP.
         """
         current_strategy = initial_strategy.copy()
         best_strategy = current_strategy.copy()
         gradients = course_segments['gradient'].values
+
+        est_duration = self._estimate_course_duration(course_segments)
+        is_long = est_duration > 3600
+
+        if is_long:
+            base_power = self.max_sustainable_power_for_duration(est_duration)
+            max_power = self.critical_power * 1.4
+            min_recovery = base_power * 0.70
+        else:
+            base_power = self.critical_power
+            max_power = self.critical_power * 1.5
+            min_recovery = self.critical_power * 0.85
         
-        # Simulate current strategy
         sim_results = self._simulate_variable_pacing(course_segments, current_strategy)
         current_w_utilization = sim_results['w_utilization']
+        best_time = sim_results['total_time'] if sim_results['feasible'] else float('inf')
         best_w_error = abs(target_w_utilization - current_w_utilization)
         
         print(f"Initial heuristic: avg {np.mean(current_strategy):.0f}W, "
               f"W' utilization: {current_w_utilization*100:.1f}% (target: {target_w_utilization*100:.0f}%)")
         
-        max_iterations = 20
+        max_iterations = 40
         for iteration in range(max_iterations):
             utilization_error = target_w_utilization - current_w_utilization
             
-            if abs(utilization_error) <= 0.03:  # 3% tolerance
+            if abs(utilization_error) <= 0.03:
                 break
-            
+
+            # For long efforts, "above base" replaces "above CP"
+            above_threshold = base_power if is_long else self.critical_power
             above_cp_indices = [i for i in range(len(current_strategy)) 
-                               if current_strategy[i] > self.critical_power]
+                               if current_strategy[i] > above_threshold]
             below_cp_indices = [i for i in range(len(current_strategy)) 
-                               if current_strategy[i] <= self.critical_power]
+                               if current_strategy[i] <= above_threshold]
             
             if not above_cp_indices:
-                # Promote highest-gradient segments to above CP
                 sorted_indices = np.argsort(gradients)[::-1]
                 above_cp_indices = sorted_indices[:max(1, len(sorted_indices) // 2)].tolist()
             
             if current_w_utilization < target_w_utilization:
-                # Need MORE W' usage — two strategies:
-                # a) Increase above-CP segment power (more depletion)
-                scale = min(1.10, 1.0 + utilization_error * 0.3)
+                # Smaller step size to avoid overshooting into infeasible
+                scale = min(1.06, 1.0 + utilization_error * 0.15)
                 for idx in above_cp_indices:
                     current_strategy[idx] *= scale
-                    current_strategy[idx] = min(float(current_strategy[idx]), self.critical_power * 1.5)
-                
-                # b) Raise below-CP segments toward CP (less recovery)
+                    current_strategy[idx] = min(float(current_strategy[idx]), max_power)
+                # Also reduce recovery (less W' recovered → higher net utilization)
                 if below_cp_indices:
+                    recovery_ceiling = (base_power * 0.99 if is_long
+                                        else self.critical_power * 0.99)
                     for idx in below_cp_indices:
-                        gap_to_cp = self.critical_power - current_strategy[idx]
-                        # Close 30% of the gap to CP each iteration
-                        current_strategy[idx] += gap_to_cp * 0.30
-                        # Don't exceed CP for recovery segments
-                        current_strategy[idx] = min(float(current_strategy[idx]), self.critical_power * 0.99)
+                        gap = recovery_ceiling - current_strategy[idx]
+                        if gap > 0:
+                            current_strategy[idx] += gap * 0.15
+                            current_strategy[idx] = min(float(current_strategy[idx]),
+                                                        recovery_ceiling)
             else:
-                # Need LESS W' usage — reduce above-CP power
-                scale = max(0.92, 1.0 - abs(utilization_error) * 0.3)
+                scale = max(0.94, 1.0 - abs(utilization_error) * 0.15)
                 for idx in above_cp_indices:
                     current_strategy[idx] *= scale
-                    current_strategy[idx] = max(self.critical_power * 1.01, float(current_strategy[idx]))
+                    floor = above_threshold * 1.01
+                    current_strategy[idx] = max(floor,
+                                                float(current_strategy[idx]))
             
-            # Re-simulate
-            new_sim_results = self._simulate_variable_pacing(course_segments, current_strategy)
-            new_w_utilization = new_sim_results['w_utilization']
-            new_error = abs(target_w_utilization - new_w_utilization)
+            new_sim = self._simulate_variable_pacing(course_segments, current_strategy)
+            new_w_util = new_sim['w_utilization']
+            new_error = abs(target_w_utilization - new_w_util)
             
-            if new_sim_results['feasible'] and new_error < best_w_error:
+            if new_sim['feasible'] and new_error < best_w_error:
                 best_strategy = current_strategy.copy()
                 best_w_error = new_error
-                current_w_utilization = new_w_utilization
-            elif not new_sim_results['feasible']:
-                # Went too far, back off from best
-                current_strategy = best_strategy.copy()
-                current_w_utilization = target_w_utilization - best_w_error  # approximate
-                break
+                best_time = new_sim['total_time']
+                current_w_utilization = new_w_util
+            elif new_sim['feasible']:
+                # Didn't improve error, but still feasible — keep going
+                current_w_utilization = new_w_util
+            else:
+                # Went infeasible — back off partially instead of giving up
+                current_strategy = (current_strategy + best_strategy) / 2.0
+                new_sim2 = self._simulate_variable_pacing(course_segments, current_strategy)
+                if new_sim2['feasible']:
+                    current_w_utilization = new_sim2['w_utilization']
+                else:
+                    current_strategy = best_strategy.copy()
+                    sim_best = self._simulate_variable_pacing(course_segments, best_strategy)
+                    current_w_utilization = sim_best['w_utilization']
         
         final_sim = self._simulate_variable_pacing(course_segments, best_strategy)
         print(f"Refined in {iteration+1} iterations: avg {np.mean(best_strategy):.0f}W, "
@@ -677,18 +1136,26 @@ class CourseOptimizer:
         num_segments = len(course_segments)
         conservative_strategy = np.full(num_segments, self.critical_power)
         
-        # Scale power continuously with gradient: more on uphills, less on downhills
+        # Conservative = at or slightly below CP for all segments.
+        # On uphills, stay at CP (no W' depletion). On descents, slightly below.
         for i, (_, segment) in enumerate(course_segments.iterrows()):
             g = segment['gradient']
-            if g > 0:
-                # Slightly above CP, proportional to gradient
-                conservative_strategy[i] = self.critical_power * (1.0 + min(g * 3, 0.1))
+            if g > 0.02:
+                # Uphill: ride at CP — conservative means no W' spend
+                conservative_strategy[i] = self.critical_power * 1.0
+            elif g > 0:
+                # Gentle uphill: at CP
+                conservative_strategy[i] = self.critical_power * 0.99
             elif g < -0.01:
-                # Recovery, deeper for steeper descents
                 recovery_depth = min(abs(g) / 0.05, 1.0)
-                conservative_strategy[i] = self.critical_power * (0.9 - recovery_depth * 0.1)
-        
-        return conservative_strategy
+                conservative_strategy[i] = self.critical_power * (0.95 - recovery_depth * 0.10)
+
+        # If cluster info present, enforce per-cluster-type consistency
+        if _has_cluster_info(course_segments):
+            cmap = _cluster_power_map_from_array(conservative_strategy,
+                                                  course_segments['segment_id'])
+            conservative_strategy = _expand_cluster_powers(
+                cmap, course_segments['segment_id'])
         
         return conservative_strategy
     
@@ -696,12 +1163,13 @@ class CourseOptimizer:
                                       power_strategy: np.ndarray,
                                       sim_results: Dict[str, Any]) -> pd.DataFrame:
         """Create detailed results DataFrame for variable pacing strategy."""
+        has_clusters = _has_cluster_info(course_segments)
         results_data = []
         
         for i, segment_result in enumerate(sim_results['segment_results']):
             segment_info = course_segments.iloc[i]
             
-            results_data.append({
+            row = {
                 'segment': i,
                 'distance': segment_info['distance'],
                 'gradient': segment_info['gradient'],
@@ -715,7 +1183,14 @@ class CourseOptimizer:
                 'energy_segment': segment_result['power'] * segment_result['time'],
                 'terrain_type': self._classify_terrain(segment_info['gradient']),
                 'power_zone': self._classify_power_zone(segment_result['power'])
-            })
+            }
+            
+            # Carry cluster metadata so the UI can group by cluster type
+            if has_clusters:
+                row['segment_id'] = int(segment_info['segment_id'])
+                row['segment_sequence'] = int(segment_info.get('segment_sequence', i))
+            
+            results_data.append(row)
         
         return pd.DataFrame(results_data)
     
@@ -1397,7 +1872,6 @@ class CourseOptimizer:
         }
 
     # ...existing code...
-
 def create_course_segments_from_course(course) -> pd.DataFrame:
     """
     Convert Course object segments to optimization-ready DataFrame.
@@ -1421,18 +1895,33 @@ def create_course_segments_from_course(course) -> pd.DataFrame:
         # New enhanced format - preserve sequence order
         print(f"Using enhanced segmentation format with {len(segments)} sequence segments")
         
+        # Resolve distance column
+        if 'distance_sum' in segments.columns:
+            dist_values = segments['distance_sum']
+        elif 'distance' in segments.columns:
+            dist_values = segments['distance']
+        else:
+            raise ValueError(f"No distance column found. Available columns: {list(segments.columns)}")
+        
+        # Resolve gradient column
+        if 'gradient_mean' in segments.columns:
+            grad_values = segments['gradient_mean']
+        elif 'gradient' in segments.columns:
+            grad_values = segments['gradient']
+        else:
+            raise ValueError(f"No gradient column found. Available columns: {list(segments.columns)}")
+        
         # Create optimization-ready DataFrame maintaining sequence order
         optimization_segments = pd.DataFrame({
-            'distance': segments['distance_sum'] * 1000,  # Convert km to meters
-            'gradient': segments['gradient_mean'] / 100,  # Convert percentage to decimal
-            'altitude': segments.get('altitude_mean', 0),  # Use mean altitude if available
-            'wind': 0,  # Default to no wind - can be enhanced later
-            # Enhanced format specific columns
-            'segment_id': segments['segment_id'],              # Terrain type (1, 2, 3, 4)
-            'segment_occurrence': segments['segment_occurrence'], # Nth occurrence of this type
-            'segment_sequence': segments['segment_sequence'],     # Position in course
-            'start_distance': segments.get('start_distance', 0) * 1000,  # Convert to meters
-            'end_distance': segments.get('end_distance', 0) * 1000       # Convert to meters
+            'distance': dist_values * 1000,  # Convert km to meters
+            'gradient': grad_values / 100,  # Convert percentage to decimal
+            'altitude': segments.get('altitude_mean', segments.get('altitude', 0)),
+            'wind': 0,
+            'segment_id': segments['segment_id'],
+            'segment_occurrence': segments['segment_occurrence'],
+            'segment_sequence': segments['segment_sequence'],
+            'start_distance': segments.get('start_distance', 0) * 1000,
+            'end_distance': segments.get('end_distance', 0) * 1000
         })
         
         # Sort by sequence to ensure proper order
@@ -1442,16 +1931,38 @@ def create_course_segments_from_course(course) -> pd.DataFrame:
         # Traditional aggregated format - backward compatibility
         print(f"Using traditional aggregated segmentation format with {len(segments)} segments")
         
+        # Resolve distance column — handle both naming conventions
+        if 'distance_sum' in segments.columns:
+            dist_values = segments['distance_sum']
+        elif 'distance' in segments.columns:
+            dist_values = segments['distance']
+        else:
+            raise ValueError(
+                f"No distance column found in course_segments. "
+                f"Available columns: {list(segments.columns)}"
+            )
+        
+        # Resolve gradient column
+        if 'gradient_mean' in segments.columns:
+            grad_values = segments['gradient_mean']
+        elif 'gradient' in segments.columns:
+            grad_values = segments['gradient']
+        else:
+            raise ValueError(
+                f"No gradient column found in course_segments. "
+                f"Available columns: {list(segments.columns)}"
+            )
+        
         # Debug: Check gradient values to determine if they're already decimals or percentages
-        sample_gradient = segments['gradient_mean'].iloc[0] if len(segments) > 0 else 0
-        gradient_is_percentage = abs(sample_gradient) > 1.0  # If >1, likely stored as percentage
+        sample_gradient = grad_values.iloc[0] if len(grad_values) > 0 else 0
+        gradient_is_percentage = abs(sample_gradient) > 1.0
         
         # Ensure required columns exist with proper names
         optimization_segments = pd.DataFrame({
-            'distance': segments['distance_sum'] * 1000,  # Convert km to meters
-            'gradient': segments['gradient_mean'] / 100,  # Always convert percentage to decimal for physics calculations
-            'altitude': segments.get('altitude_mean', 0),  # Use mean altitude if available
-            'wind': 0  # Default to no wind - can be enhanced later
+            'distance': dist_values * 1000,  # Convert km to meters
+            'gradient': grad_values / 100,  # Always convert percentage to decimal
+            'altitude': segments.get('altitude_mean', segments.get('altitude', 0)),
+            'wind': 0
         })
     
     # Validate gradients are reasonable (between -0.3 and 0.3 for -30% to 30%)

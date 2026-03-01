@@ -1,3 +1,7 @@
+# ============================================================================
+# ARCHIVE — These functions are NOT used by the active Streamlit app.
+# Retained for test compatibility. Review and delete as needed.
+# ============================================================================
 """
 Granular Visualization System for Course Optimization
 

@@ -1,3 +1,11 @@
+# ============================================================================
+# ARCHIVE — These functions are NOT used by the active Streamlit app.
+# They are retained for test compatibility and notebook use.
+# The active app charts live in pages_vibe/tabs/tab_optimization.py and
+# pages_vibe/tabs/tab_course.py.
+# Review and delete as needed.
+# ============================================================================
+
 import matplotlib.pyplot as plt
 from matplotlib.colors import Normalize, to_rgba
 import pydeck as pdk

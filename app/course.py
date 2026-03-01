@@ -821,9 +821,12 @@ class Course:
         self.aggregate_segments()
         
         # Add terrain classification to aggregated segments
-        if hasattr(self, 'course_segments'):
+        if hasattr(self, 'course_segments') and not self.course_segments.empty:
             terrain_map = df.groupby('segment')['segment_terrain'].first().to_dict()
-            self.course_segments['terrain'] = self.course_segments['segment'].map(terrain_map)
+            # Enhanced format uses 'segment_id'; legacy uses 'segment'
+            seg_col = 'segment_id' if 'segment_id' in self.course_segments.columns else 'segment'
+            if seg_col in self.course_segments.columns:
+                self.course_segments['terrain'] = self.course_segments[seg_col].map(terrain_map)
         
         # Print summary
         print(f"Created {df['segment'].nunique()} contiguous segments:")

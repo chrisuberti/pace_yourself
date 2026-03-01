@@ -447,12 +447,22 @@ class WTankCalculator:
             raise ValueError("Critical power must be provided to estimate best efforts.")
 
         # Base multipliers for power at different durations (relative to critical power)
+        # Extended to 4 hours using endurance decay model (k ≈ 0.05)
         if self.rider_type == "time_trialist":
-            multipliers = {60: 1.4, 300: 1.2, 600: 1.1, 1200: 1.05, 1800: 1.02, 3600: 1.0}
+            multipliers = {
+                60: 1.4, 300: 1.2, 600: 1.1, 1200: 1.05, 1800: 1.02, 3600: 1.0,
+                7200: 0.965, 10800: 0.945, 14400: 0.93,  # 2h, 3h, 4h
+            }
         elif self.rider_type == "sprinter":
-            multipliers = {60: 1.8, 300: 1.4, 600: 1.2, 1200: 1.1, 1800: 1.05, 3600: 1.0}
+            multipliers = {
+                60: 1.8, 300: 1.4, 600: 1.2, 1200: 1.1, 1800: 1.05, 3600: 1.0,
+                7200: 0.960, 10800: 0.935, 14400: 0.915,
+            }
         elif self.rider_type == "all_rounder":
-            multipliers = {60: 1.6, 300: 1.3, 600: 1.15, 1200: 1.08, 1800: 1.03, 3600: 1.0}
+            multipliers = {
+                60: 1.6, 300: 1.3, 600: 1.15, 1200: 1.08, 1800: 1.03, 3600: 1.0,
+                7200: 0.963, 10800: 0.940, 14400: 0.923,
+            }
         else:
             raise ValueError("Invalid rider type. Choose from 'time_trialist', 'sprinter', or 'all_rounder'.")
 
@@ -481,31 +491,79 @@ class WTankCalculator:
 
     def _power_duration_model(self, t, CP, W_prime):
         """
-        Modified power-duration model: P(t) = CP + W' / t
-        The parameter `k` adjusts the curve's shape and asymptote.
+        Power-duration model for curve fitting: P(t) = CP + W' / t
+        Used for durations up to ~1 hour to estimate CP and W'.
         """
         return CP + W_prime / (t)
 
+    @staticmethod
+    def piecewise_power_duration(t, CP, W_prime, k=0.05):
+        """Piecewise power-duration model valid from seconds to 4+ hours.
+
+        For t ≤ 3600s:  P(t) = CP + W'/t       (classic CP model)
+        For t > 3600s:   P(t) = CP × (3600/t)^k (endurance decay)
+
+        The endurance exponent *k* captures the slow decline in sustainable
+        power beyond one hour due to glycogen depletion, thermal drift,
+        and central fatigue.  Typical values:
+          k ≈ 0.04  (well-trained endurance athletes)
+          k ≈ 0.05  (all-rounders)
+          k ≈ 0.07  (pure sprinters / less endurance-adapted)
+
+        The function is continuous at t=3600: both pieces give P=CP.
+
+        Args:
+            t: Duration in seconds (scalar or array).
+            CP: Critical power in watts.
+            W_prime: Anaerobic capacity (W') in joules.
+            k: Endurance fatigue exponent (default 0.05).
+
+        Returns:
+            Power in watts (same shape as t).
+        """
+        t = np.asarray(t, dtype=float)
+        scalar = t.ndim == 0
+        t = np.atleast_1d(t)
+
+        power = np.where(
+            t <= 3600,
+            CP + W_prime / np.maximum(t, 1.0),
+            CP * (3600.0 / np.maximum(t, 1.0)) ** k,
+        )
+
+        return float(power[0]) if scalar else power
+
     def _estimate_w_tank_from_curve(self):
-        """Estimate W' based on the modified power-duration curve."""
+        """Estimate W' based on the modified power-duration curve.
+        
+        Only fits the CP+W'/t model to durations ≤ 3600s (the hyperbolic regime).
+        Longer durations follow the endurance decay model and should not influence
+        the CP/W' parameter estimation.
+        """
         if not self.best_efforts:
             self._populate_best_efforts()  # Populate best efforts if not provided
 
         durations = np.array(list(self.best_efforts.keys()))
         powers = np.array(list(self.best_efforts.values()))
 
-        # Apply weights: prioritize durations >= 1200 seconds
-        weights = np.ones_like(durations)
-        weights[durations >= 1200] = 10  # Assign higher weight to longer durations
+        # Only fit CP+W'/t model to durations ≤ 1 hour
+        mask = durations <= 3600
+        fit_durations = durations[mask]
+        fit_powers = powers[mask]
 
-        # Curve fitting with weights
+        if len(fit_durations) < 2:
+            # Not enough short-duration data, use all
+            fit_durations = durations
+            fit_powers = powers
+
+        # Curve fitting with the hyperbolic model
         popt, _ = curve_fit(
             self._power_duration_model,
-            durations,
-            powers
+            fit_durations,
+            fit_powers
         )
-        self.popt = popt  # Store the fitted parameters (CP, W_prime
-        estimated_cp, w_prime= popt
+        self.popt = popt  # Store the fitted parameters (CP, W_prime)
+        estimated_cp, w_prime = popt
 
         # Store critical power if not provided
         if self.critical_power is None:
@@ -525,7 +583,7 @@ class WTankCalculator:
         return self.w_tank
 
     def plot_power_duration_curve(self):
-        """Plot the power-duration curve if best efforts data is available."""
+        """Plot the piecewise power-duration curve (short + endurance)."""
         if not self.best_efforts:
             self._populate_best_efforts()  # Populate best efforts if not provided
 
@@ -535,20 +593,40 @@ class WTankCalculator:
         # Unpack the fitted parameters
         estimated_cp, w_prime = self.popt
 
-        # Generate a smooth curve with fewer points
-        t_fit = np.linspace(min(durations), max(durations), 200)  # Reduced from 500 to 200 points
-        p_fit = self._power_duration_model(t_fit, estimated_cp, w_prime)
+        # Generate a smooth curve from shortest effort out to 4 hours
+        max_t = max(max(durations), 14400)  # At least 4 hours
+        t_fit = np.linspace(min(durations), max_t, 400)
 
-        # Create the plot with a smaller figure size
-        fig, ax = plt.subplots(figsize=(6, 4))  # Adjusted figure size
-        ax.scatter(durations, powers, color='red', label='Best Efforts Data')
-        ax.plot(t_fit, p_fit, label=f'Fitted Curve\nCP={estimated_cp:.2f} W, W\'={w_prime:.2f} J')
-        ax.axhline(y=estimated_cp, color='gray', linestyle='--', label=f'Asymptote (CP={estimated_cp:.2f} W)')
-        ax.text(max(durations) * 0.8, estimated_cp * 1.05, f'CP={estimated_cp:.2f} W', color='gray')
-        ax.set_xlabel('Duration (s)')
+        # Use the piecewise model for the full range
+        p_fit = self.piecewise_power_duration(t_fit, estimated_cp, w_prime)
+
+        # Create the plot
+        fig, ax = plt.subplots(figsize=(7, 4))
+        ax.scatter(durations / 60, powers, color='red', zorder=5,
+                   label='Best Efforts Data')
+        ax.plot(t_fit / 60, p_fit,
+                label=f'Piecewise Model\nCP={estimated_cp:.0f} W, W\'={w_prime:.0f} J')
+
+        # Mark the CP transition at 60 min
+        ax.axhline(y=estimated_cp, color='gray', linestyle='--', alpha=0.6,
+                    label=f'CP = {estimated_cp:.0f} W')
+        ax.axvline(x=60, color='orange', linestyle=':', alpha=0.5,
+                    label='CP/endurance boundary')
+
+        # Shade the endurance decay region
+        endurance_t = t_fit[t_fit > 3600]
+        endurance_p = p_fit[len(t_fit) - len(endurance_t):]
+        if len(endurance_t) > 0:
+            ax.fill_between(endurance_t / 60, endurance_p, estimated_cp,
+                            alpha=0.1, color='blue',
+                            label='Endurance decay zone')
+
+        ax.set_xlabel('Duration (min)')
         ax.set_ylabel('Power (W)')
-        ax.grid()
-        ax.legend()
+        ax.set_title('Power-Duration Curve')
+        ax.grid(alpha=0.3)
+        ax.legend(fontsize=8)
+        ax.set_xlim(left=0)
 
         return fig  # Return the figure object
 

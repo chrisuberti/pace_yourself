@@ -12,6 +12,7 @@ permissions:
 jobs:
   pytest:
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     services:
       postgres:
         image: postgres:16
@@ -30,6 +31,9 @@ jobs:
       PACE_TEST_DATABASE_URL: postgresql://pace:pace@localhost:5432/pace_yourself_test
       DATABASE_URL: postgresql://pace:pace@localhost:5432/pace_yourself_test
       MPLBACKEND: Agg
+      OMP_NUM_THREADS: "1"
+      OPENBLAS_NUM_THREADS: "1"
+      MKL_NUM_THREADS: "1"
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -41,6 +45,7 @@ jobs:
           python -m venv .venv
           .venv/bin/pip install -r requirements-dev.txt
       - name: Run regression suite
+        timeout-minutes: 5
         run: |
           source .venv/bin/activate
-          .venv/bin/python -m pytest tests/ -q
+          .venv/bin/python -m pytest tests/ -v --durations=10 -o faulthandler_timeout=60

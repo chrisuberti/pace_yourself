@@ -1,6 +1,6 @@
 # MVP Status (Operational Source of Truth)
 
-Last updated: 2026-10-15
+Last updated: 2026-10-16
 
 ## Goal
 Deliver an MVP in 3-4 weeks with one canonical app path and staged legacy deprecation.
@@ -116,6 +116,39 @@ Regression coverage runs in GitHub Actions with an isolated PostgreSQL service.
 Local databases, OS metadata, secrets, and conversation exports are excluded from
 application commits/container context. Docker/Render configuration is scaffolding,
 not confirmation that the remaining deployment gates are complete.
+
+Historical context reconciliation completed 2026-10-16: the imported rider,
+terrain/optimizer, workflow, authentication, and PostgreSQL work is already
+represented on current master by the 2026-10-15 consolidation. There is no
+remaining branch-recovery or re-integration task. Historical test counts are
+evidence from their original worktrees, not current validation results.
+
+### Outstanding Deployment Requirements and Decisions
+
+Requirements before a multi-user deployment:
+- Replace athlete-ID rider cache ownership with enforced application `user_id`
+  ownership and auth foreign keys.
+- Add an auth foreign key for optimization result ownership and reject
+  ownerless result writes in authenticated flows.
+- Validate the legacy SQLite backfill into an isolated PostgreSQL database,
+  including the expected handling of orphaned segmentations and non-finite JSON
+  values.
+- Add an integration regression proving the canonical UI constructs
+  `CourseOptimizer` with committed rider mass plus bike mass, CdA, and Crr.
+- Provision the production PostgreSQL and web service, configure
+  `TOKEN_ENCRYPTION_KEY`, Strava credentials, and the registered production
+  callback, then run the authenticated Course -> Segment -> Rider -> Optimize
+  smoke test.
+
+Product/deployment decisions that require owner input before changing direction:
+- **Course visibility:** the implementation currently provides one deduplicated,
+  globally shared course/segmentation library with creator provenance. Decide
+  whether that remains the approved MVP policy or whether private/"My Courses"
+  ownership is required before deployment.
+- **OAuth scaling:** issued OAuth states currently live in process memory. Keep
+  one non-sleeping web instance for the MVP, or approve shared durable OAuth
+  state before horizontal scaling. The current implementation is not safe for
+  callback routing across multiple instances.
 
 ## Exit Criteria for MVP
 - End-to-end app path works from Course -> Segment -> Rider -> Optimize
@@ -247,6 +280,8 @@ Acceptance criteria:
 ### Phase 5 - MVP Validation and Migration Decision
 - Add focused tests for workflow transitions, stale-result behavior, and action
   boundaries around Strava and optimization calls.
+- Add a UI-to-optimizer integration regression proving committed rider mass plus
+  bike mass, CdA, and Crr reach `CourseOptimizer`.
 - Run the canonical test suite and a manual happy-path/error-path walkthrough.
 - Record rough timings for course processing, Strava fetch, segmentation, and
   optimization so slow operations are visible and cancellable where practical.

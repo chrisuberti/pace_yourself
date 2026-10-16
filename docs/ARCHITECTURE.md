@@ -46,6 +46,10 @@ runtime path.
 	`CourseOptimizer`; legacy callers retain documented constructor defaults.
 - Segment and granular simulations may differ in resolution, but must use the
 	same rider physics and exponential W' recovery model.
+- Exact elapsed-time equality is not required when point-resolution and
+  segment-average inputs use different discretizations. Kernel and rider-input
+  parity are the contract; detailed simulation is the canonical final comparison
+  layer.
 - Detailed simulation is the common comparison layer for final strategy
 	visualization.
 
@@ -79,10 +83,11 @@ runtime path.
 	and execution timing for a course/segmentation pair.
 - Rider power efforts and profile data are managed separately by `app/rider.py`.
 - Courses and segmentations currently form a shared library with `created_by`
-  provenance, not enforced private ownership. Optimization queries filter
-  `owner_user_id`, which is nullable and has no auth foreign key. Rider cache
-  operations currently identify rows by athlete ID; the intended application-user
-  ownership contract is not yet enforced.
+  provenance, not enforced private ownership. This describes current storage
+  behavior, not an approved long-term visibility policy. Optimization queries
+  filter `owner_user_id`, which is nullable and has no auth foreign key. Rider
+  cache operations currently identify rows by athlete ID; the intended
+  application-user ownership contract is not yet enforced.
 
 ### PostgreSQL Migration Order
 1. Authentication: `users` and encrypted `strava_tokens` (implemented).
@@ -101,6 +106,10 @@ runtime path.
 - `pages_vibe/auth_ui.py` performs the authorize/callback flow, validates OAuth
 	state, binds the returned `user_id` to the Streamlit session, and clears all
 	session state on logout.
+- Issued OAuth states are single-use, expire after ten minutes, and are stored in
+  process memory so they survive the Streamlit redirect/session boundary. Until
+  that store becomes shared and durable, production must use one non-sleeping web
+  instance; horizontal callback routing is unsupported.
 - `app/auth.py` exchanges authorization codes and refreshes tokens per user.
 	`app/strava_calls.py` requires that user ID when resolving a token.
 - `Verify Strava Account` calls `/athlete` only, then stores the athlete ID,

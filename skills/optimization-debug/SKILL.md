@@ -23,8 +23,12 @@ Accepted aliases:
 - `altitude_mean` → `altitude`
 
 Unit conversion rules:
-- `|gradient| > 1` means percent → divide by 100
-- `distance < 100` means km → multiply by 1000
+- Canonical `gradient` is decimal and `distance` is meters, including gentle
+  grades and short segments.
+- Aggregated `gradient_mean` is percent → divide by 100; `distance_sum` is km →
+  multiply by 1000.
+- Course point grades (including `gradient_smoothed`) are percentages.
+- Never infer units from value magnitude.
 
 Regression test: [tests/tests/test_optimization_boundary_contract.py](../../tests/tests/test_optimization_boundary_contract.py).
 

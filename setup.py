@@ -6,7 +6,7 @@ setup(
     packages=find_packages(),
     install_requires=[
         'numpy',
-        'pandas',
+        'pandas>=2.3,<3',
         'matplotlib',
         'plotly',
         'pydeck',

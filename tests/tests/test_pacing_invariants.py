@@ -109,8 +109,8 @@ class TestGradientSmoothing:
 
     def test_real_route_gradient_is_clean(self):
         """Processing a real route must not leave the profile saturated at clamp."""
-        df = pd.read_csv("data/sample_routes/1504789_processed_course.csv")
-        course = Course(df[['lat', 'lon', 'altitude']].copy())
+        df = pd.read_csv(NF4832_FIXTURE)
+        course = Course(df)
         g = course.df['gradient']
         assert np.isfinite(g).all()
         # Almost nothing should sit pinned at the ±max_gradient clamp.

@@ -59,6 +59,8 @@ With `.venv` activated, install development dependencies and run the suite:
 .venv/bin/pip install -r requirements-dev.txt
 .venv/bin/python -m pytest tests/ -q
 ```
+The supported pandas series is 2.x (`>=2.3,<3`); pandas 3 compatibility is not
+yet established.
 Database integration tests require an isolated, disposable PostgreSQL database:
 ```bash
 createdb pace_yourself_test

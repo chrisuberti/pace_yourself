@@ -1,0 +1,4 @@
+# Development-only dependencies (not installed in the production image)
+-r requirements.txt
+jupyter
+pytest

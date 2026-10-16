@@ -1,86 +1,88 @@
-# 🚴‍♂️ Pace Yourself - Cycling Performance Optimization
+# Pace Yourself
 
-A comprehensive cycling performance analysis and course optimization tool that integrates Strava data, physics-based modeling, and advanced pacing strategies.
+Cycling performance optimization with Streamlit, Strava integration, and physics-based pacing simulation.
 
-## 🆕 **Phase 1 Complete: Optimization Engine**
+## Current Runtime (Canonical)
+- Entry point: `main.py`
+- App shell: `pages_vibe/01_Race_Lab.py`
+- Active tabs:
+  - `pages_vibe/tabs/tab_course.py`
+  - `pages_vibe/tabs/tab_segmentation.py`
+  - `pages_vibe/tabs/tab_rider.py`
+  - `pages_vibe/tabs/tab_optimization.py`
 
-### New Features
-- **Course Optimization Engine**: Physics-based power modeling and race simulation
-- **W' Energy Dynamics**: Advanced anaerobic capacity tracking and recovery modeling  
-- **Optimal Pacing Strategies**: Find the optimal constant power for any course
-- **Performance Metrics**: TSS, IF, power-to-weight, and critical segment analysis
-- **Interactive Streamlit Interface**: Real-time optimization with comprehensive visualizations
+Legacy files under `archive/` are reference-only and are being deprecated in staged cleanup sprints.
 
-### Core Capabilities
-- **Strava Integration**: Fetch and analyze course data from Strava segments
-- **Course Segmentation**: Multiple algorithms (equal distance, auto-clustering, manual)
-- **Physics Modeling**: Air resistance, rolling resistance, gradient, and wind effects
-- **Rider Profiling**: Critical power, W', and aerodynamic modeling
-- **Route Visualization**: Interactive maps and elevation profiles
+## MVP Scope (3-4 Weeks)
+- Course load/import and segmentation
+- Rider setup
+- Constant vs variable pacing comparison
+- Database-backed course persistence
+- Strava OAuth/API data flow
 
-## 🚀 **Getting Started**
-
-### Prerequisites
-- Python 3.8+
-- Strava API credentials (optional, for live data)
-
-### Installation
-
-1. Clone the repository
+## Setup
+1. Create and activate the project virtual environment:
    ```bash
-   git clone https://github.com/your-username/pace-yourself.git
-   cd pace-yourself
+   python3 -m venv .venv
+   source .venv/bin/activate
    ```
-
-2. Install dependencies
+2. Install dependencies:
    ```bash
-   pip install -r requirements.txt
+   .venv/bin/pip install -r requirements.txt
    ```
-
-3. Set up environment variables (optional)
+3. Start PostgreSQL (or use an existing server) and copy the environment template:
    ```bash
-   # Create .env file with:
+   docker compose up -d db
+   cp .env.example .env
+   ```
+   Set these values in `.env`; the example database URL matches Docker Compose:
+   ```bash
    ROUTE_PATH=data/sample_routes
+   DATABASE_URL=postgresql://pace:pace@localhost:5432/pace_yourself
+   TOKEN_ENCRYPTION_KEY=your_fernet_key
    STRAVA_CLIENT_ID=your_client_id
    STRAVA_CLIENT_SECRET=your_client_secret
+   STRAVA_REDIRECT_URI=http://localhost:8501
    ```
-
-4. Run the application
+   Generate `TOKEN_ENCRYPTION_KEY` with
+   `.venv/bin/python -c "from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())"`.
+   Register the redirect URI's domain as the Strava app's Authorization Callback
+   Domain. Never commit `.env`, Streamlit secrets, or local databases.
+4. Run app:
    ```bash
-   streamlit run main.py
+   .venv/bin/python -m streamlit run main.py
    ```
 
-## 📊 **Usage Examples**
-
-### Quick Optimization
-```python
-from app.optimization import CourseOptimizer
-from app.course import Course
-import pandas as pd
-
-# Load course data
-course_data = pd.read_csv('data/sample_routes/example_route.csv')
-course = Course(course_data)
-course.equal_segmentation(8)
-
-# Create optimizer
-optimizer = CourseOptimizer(critical_power=300, w_prime=25000)
-
-# Find optimal power strategy
-optimal_power, time, results = optimizer.optimize_constant_power(
-    create_course_segments_from_course(course)
-)
-
-print(f"Optimal power: {optimal_power:.0f}W")
-print(f"Race time: {time/60:.1f} minutes")
+## Development and Validation
+With `.venv` activated, install development dependencies and run the suite:
+```bash
+.venv/bin/pip install -r requirements-dev.txt
+.venv/bin/python -m pytest tests/ -q
 ```
-
-### Comprehensive Analysis
-```python
-# Full performance analysis
-analysis = optimizer.analyze_pacing_strategy(course_segments)
-
-print(f"TSS: {analysis['performance_metrics']['tss_estimate']:.0f}")
-print(f"W' Utilization: {analysis['w_prime_utilization_percent']:.1f}%")
-print(f"Critical segments: {len(analysis['critical_segments'])}")
+The supported runtime uses pandas 2.x (`>=2.3,<3`) and Streamlit 1.52.x.
+Major pandas upgrades and Streamlit minor upgrades require a compatibility pass
+over segmentation and the AppTest widget/form contracts before widening these
+ranges.
+Database integration tests require an isolated, disposable PostgreSQL database:
+```bash
+createdb pace_yourself_test
+PACE_TEST_DATABASE_URL=postgresql:///pace_yourself_test .venv/bin/python -m pytest tests/ -q
 ```
+Never point integration tests at production. GitHub Actions runs the suite
+against a fresh PostgreSQL service for pull requests to `main` or `master`.
+
+## Deployment Status
+`Dockerfile` and `render.yaml` provide container and Render deployment scaffolding.
+Auth, rider, course, segmentation, and result stores now use PostgreSQL. This does
+not yet establish a multi-user-safe release: rider ownership, shared/private course
+policy, database-enforced ownership, and SQLite data backfill still need review.
+See `docs/STATUS_MVP.md` for the deployment gate.
+
+## Documentation Map
+- Master MVP workplan and status: `docs/STATUS_MVP.md`
+- Condensed architecture: `docs/ARCHITECTURE.md`
+- Long-range strategy: `PROJECT_ROADMAP.md`
+
+## Notes
+- Notebooks in `notebooks/` are retained for experimentation/validation.
+- Production behavior should live in `app/` and `pages_vibe/`.

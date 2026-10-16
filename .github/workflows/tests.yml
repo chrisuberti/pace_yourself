@@ -1,0 +1,51 @@
+name: Tests
+
+on:
+  pull_request:
+    branches: [main, master]
+  push:
+    branches: [main, master]
+
+permissions:
+  contents: read
+
+jobs:
+  pytest:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: pace
+          POSTGRES_PASSWORD: pace
+          POSTGRES_DB: pace_yourself_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U pace -d pace_yourself_test"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    env:
+      PACE_TEST_DATABASE_URL: postgresql://pace:pace@localhost:5432/pace_yourself_test
+      DATABASE_URL: postgresql://pace:pace@localhost:5432/pace_yourself_test
+      MPLBACKEND: Agg
+      OMP_NUM_THREADS: "1"
+      OPENBLAS_NUM_THREADS: "1"
+      MKL_NUM_THREADS: "1"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+      - name: Install dependencies
+        run: |
+          python -m venv .venv
+          .venv/bin/pip install -r requirements-dev.txt
+      - name: Run regression suite
+        timeout-minutes: 5
+        run: |
+          source .venv/bin/activate
+          .venv/bin/python -m pytest tests/ -v --durations=10 -o faulthandler_timeout=60

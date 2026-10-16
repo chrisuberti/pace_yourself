@@ -1,8 +1,10 @@
 import pandas as pd
-from strava_calls import *
 import numpy as np
+import traceback
+from app.strava_calls import get_activities, get_power_stream
 
-def calculate_critical_power(activities, durations):
+
+def calculate_critical_power(activities, durations, user_id=None):
     """
     Calculate the best critical power for specified durations.
 
@@ -20,7 +22,7 @@ def calculate_critical_power(activities, durations):
 
         try:
             # Attempt to get the power stream
-            power_stream = get_power_stream(activity_id)
+            power_stream = get_power_stream(activity_id, user_id=user_id)
         except Exception as e:
             print(f"Error processing activity {activity_id}: {e}")
             continue
@@ -36,19 +38,21 @@ def calculate_critical_power(activities, durations):
     return best_power
 
 
+# Main workflow - only runs when executed directly
+if __name__ == "__main__":
+    try:
+        print('starting')
+        # Fetch activities from the last 90 days
+        activities = get_activities(days=90)
+        print(f'Found {len(activities)} activities')
+        
+        durations = [5, 30, 60, 300, 1200]  # Durations in seconds (5s, 30s, 1min, 5min, 20min)
+        critical_power = calculate_critical_power(activities, durations)
 
-# Main workflow
-try:
-    print('starting')
-    activities = get_activities()  # Retrieve activities using the token from auth.py
-    print('activities', activities)
-    durations = [5, 30, 60, 300, 1200]  # Durations in seconds (5s, 30s, 1min, 5min, 20min)
-    critical_power = calculate_critical_power(activities, durations)
-
-    print("Critical Power Profile:")
-    for duration, power in critical_power.items():
-        print(f"{duration}s: {power:.2f} watts")
-except Exception as e:
-    print(f"Error: {e}")
-    print("Traceback:")
-    print(traceback.format_exc())
+        print("Critical Power Profile:")
+        for duration, power in critical_power.items():
+            print(f"{duration}s: {power:.2f} watts")
+    except Exception as e:
+        print(f"Error: {e}")
+        print("Traceback:")
+        print(traceback.format_exc())

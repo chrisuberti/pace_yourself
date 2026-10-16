@@ -1,0 +1,27 @@
+services:
+  - type: web
+    name: pace-yourself
+    runtime: docker
+    dockerfilePath: ./Dockerfile
+    plan: starter
+    healthCheckPath: /_stcore/health
+    envVars:
+      - key: DATABASE_URL
+        fromDatabase:
+          name: pace-yourself-db
+          property: connectionString
+      - key: TOKEN_ENCRYPTION_KEY
+        sync: false
+      - key: STRAVA_CLIENT_ID
+        sync: false
+      - key: STRAVA_CLIENT_SECRET
+        sync: false
+      - key: STRAVA_REDIRECT_URI
+        sync: false
+      - key: ROUTE_PATH
+        value: data/sample_routes
+
+databases:
+  - name: pace-yourself-db
+    plan: basic-256mb
+    postgresMajorVersion: "16"

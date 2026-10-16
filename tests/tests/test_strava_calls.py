@@ -7,8 +7,8 @@ from app.strava_calls import fetch_segment_data, get_activities, get_power_strea
 
 class TestStravaCalls(unittest.TestCase):
 
-    @patch('strava_calls.get_access_token')
-    @patch('strava_calls.requests.get')
+    @patch('app.strava_calls.get_access_token')
+    @patch('app.strava_calls.requests.get')
     def test_fetch_segment_data(self, mock_get, mock_get_access_token):
         mock_get_access_token.return_value = 'fake_access_token'
         mock_response = MagicMock()
@@ -20,14 +20,15 @@ class TestStravaCalls(unittest.TestCase):
         mock_get.return_value = mock_response
 
         segment_id = 123456
-        result = fetch_segment_data(segment_id)
+        result = fetch_segment_data(segment_id, user_id='test-user')
+        mock_get_access_token.assert_called_once_with('test-user')
         self.assertIsNotNone(result)
         self.assertIn('latlng', result)
         self.assertIn('altitude', result)
         print("fetch_segment_data result:", result)
 
-    @patch('strava_calls.get_access_token')
-    @patch('strava_calls.requests.get')
+    @patch('app.strava_calls.get_access_token')
+    @patch('app.strava_calls.requests.get')
     def test_get_activities(self, mock_get, mock_get_access_token):
         mock_get_access_token.return_value = 'fake_access_token'
         mock_response = MagicMock()
@@ -38,14 +39,15 @@ class TestStravaCalls(unittest.TestCase):
         ]
         mock_get.return_value = mock_response
 
-        result = get_activities()
+        result = get_activities(days=30, user_id='test-user')
+        mock_get_access_token.assert_called_once_with('test-user')
         self.assertIsNotNone(result)
         self.assertIsInstance(result, list)
         self.assertGreater(len(result), 0)
         print("get_activities result:", result)
 
-    @patch('strava_calls.get_access_token')
-    @patch('strava_calls.requests.get')
+    @patch('app.strava_calls.get_access_token')
+    @patch('app.strava_calls.requests.get')
     def test_get_power_stream(self, mock_get, mock_get_access_token):
         mock_get_access_token.return_value = 'fake_access_token'
         mock_response = MagicMock()
@@ -56,7 +58,8 @@ class TestStravaCalls(unittest.TestCase):
         mock_get.return_value = mock_response
 
         activity_id = 123456
-        result = get_power_stream(activity_id)
+        result = get_power_stream(activity_id, user_id='test-user')
+        mock_get_access_token.assert_called_once_with('test-user')
         self.assertIsNotNone(result)
         self.assertIsInstance(result, list)
         self.assertGreater(len(result), 0)

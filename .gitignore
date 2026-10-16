@@ -1,8 +1,27 @@
 .streamlit/secrets.toml
 
+# macOS
+.DS_Store
+
+# Jupyter Notebooks (may contain outputs with personal data)
+notebooks/
+
+# Utility scripts (local dev helpers)
+scripts/
+
 # Development directories (if recreated)
 .copilot/
-docs/
+# Local conversation exports (not application fixtures)
+/app_status_MVP_migrarion.json
+/cluster_method_bug.json
+/rider_workflow.json
+# One-off probes tied to local route files or database IDs
+/tests/debug/bruteforce_cluster_pacing.py
+/tests/debug/check_ptyp_pacing.py
+/tests/debug/trace_cluster_pacing.py
+docs/*
+!docs/ARCHITECTURE.md
+!docs/STATUS_MVP.md
 notes/
 *.ps1
 .vscode/
@@ -73,6 +92,9 @@ cover/
 local_settings.py
 db.sqlite3
 db.sqlite3-journal
+*.db
+*.sqlite
+*.sqlite3
 
 # Flask stuff:
 instance/

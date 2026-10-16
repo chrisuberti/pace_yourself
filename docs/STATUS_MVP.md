@@ -1,6 +1,6 @@
 # MVP Status (Operational Source of Truth)
 
-Last updated: 2026-10-15
+Last updated: 2026-10-16
 
 ## Goal
 Deliver an MVP in 3-4 weeks with one canonical app path and staged legacy deprecation.
@@ -52,8 +52,8 @@ priorities, acceptance criteria, blockers, and execution updates belong here.
 - Use this file as the only active implementation workplan
 
 ## Active Priority
-**Next implementation phase:** MVP Streamlit UX Workplan, Phase 3 - Durable
-Results and Stale-State Model. Complete the phases below in order unless a
+**Next implementation phase:** MVP Streamlit UX Workplan, Phase 4 - Feedback
+and Layout Polish. Complete the phases below in order unless a
 blocking defect takes priority.
 
 | Phase | Status |
@@ -61,12 +61,12 @@ blocking defect takes priority.
 | Documentation consolidation | Complete |
 | 1. Guided App Shell | Complete |
 | 2. Explicit Commit and Action Boundaries | Complete |
-| 3. Durable Results and Stale-State Model | Next |
-| 4. Feedback and Layout Polish | Queued |
+| 3. Durable Results and Stale-State Model | Complete |
+| 4. Feedback and Layout Polish | Next |
 | 5. MVP Validation and Migration Decision | Queued |
 
 Phases 1 and 2 completed 2026-08-08: the canonical runtime now renders one
-workflow step at a time from a persistent sidebar rail, shows the active setup,
+workflow step at a time from a persistent workflow navigator, shows the active setup,
 provides contextual Continue actions, and requires explicit Load, Process,
 Fetch, Apply, Calculate, Import, and Optimize actions before committing work.
 Integrated AppTest coverage verified the Course -> Segment -> Rider -> Optimize
@@ -142,7 +142,7 @@ The MVP response is to design around those constraints rather than migrate the
 UI framework now.
 
 ### Target Experience
-- A persistent left workflow rail for Course -> Segment -> Rider -> Optimize.
+- A persistent top workflow navigator for Course -> Segment -> Rider -> Optimize.
 - One focused workspace at a time instead of four simultaneously rendered tabs.
 - A persistent course/rider summary visible throughout the workflow.
 - Forms that commit related values together and distinguish draft inputs from
@@ -170,8 +170,8 @@ UI framework now.
 Target: `pages_vibe/01_Race_Lab.py`, `pages_vibe/tabs/state.py`, and
 `pages_vibe/tabs/_workflow.py`.
 
-- Replace the four top-level `st.tabs` with a sidebar workflow rail backed by a
-  single `vibe_active_step` value.
+- Replace the four top-level `st.tabs` with a tab-styled workflow navigator
+  backed by a single `vibe_active_step` value.
 - Render only the active step's module.
 - Show completion, current, blocked, and stale states in the rail.
 - Allow revisiting completed steps; block forward navigation only when a true
@@ -221,10 +221,27 @@ Targets: `pages_vibe/tabs/_workflow.py`, `pages_vibe/tabs/state.py`, and
 - Provide an explicit reset/new-analysis action rather than relying on implicit
   downstream state deletion.
 
+State and navigation contract:
+- Navigation-only actions update `vibe_active_step` and never revise committed
+  inputs, stale a result, call an API, or start computation.
+- Committed course, segmentation, rider/physics, and optimization settings own
+  separate revisions. A successful result stores the revisions and lightweight
+  rider/course display context that produced it.
+- Upstream commits invalidate current prerequisites where necessary but retain
+  the last result. The Optimize workspace remains reachable to inspect stale
+  output, and replacement occurs only after a complete successful rerun.
+- New analysis is the explicit clearing boundary for course, segmentation, and
+  results; authentication and the rider profile remain available.
+
 Acceptance criteria:
 - Parameter edits never make a valid result disappear unexpectedly.
 - Failed recalculation leaves the last valid result available.
 - Export clearly identifies whether it represents current or stale inputs.
+
+Completed 2026-10-16: the canonical Race Lab combines a status-aware top
+navigator with single-workspace rendering. Result signatures now distinguish
+navigation from committed state changes, preserve stale results and their chart
+context, label exports, and keep the prior result after failed recalculation.
 
 ### Phase 4 - Feedback and Layout Polish (Should Have)
 - Standardize operation feedback: pending spinner/status, success confirmation,

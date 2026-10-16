@@ -100,7 +100,8 @@ def test_segment_import_commits_course_only_on_explicit_fetch(monkeypatch):
     assert app.session_state["vibe_course_id"] == "saved-course"
     assert app.session_state["vibe_course_name"] == "Imported climb"
     assert not app.session_state["vibe_segmentation_applied"]
-    assert app.session_state["vibe_optimization_results"] is None
+    assert app.session_state["vibe_optimization_results"] == {"old": True}
+    assert app.session_state["vibe_course_revision"] == 1
     assert app.session_state["auth_user_id"] == "course-owner"
 
     app.run()
@@ -165,7 +166,7 @@ def test_rider_refresh_stages_weight_before_widget_rerun(
     assert app.number_input(key="rider_general_weight").value == expected_weight
     assert app.session_state["vibe_pending_rider_weight"] is None
     assert app.session_state["vibe_rider_obj"] is imported
-    assert app.session_state["vibe_optimization_results"] is None
+    assert app.session_state["vibe_optimization_results"] == {"old": True}
     assert app.session_state["vibe_segmentation_applied"]
     assert app.session_state["auth_user_id"] == "rider-owner"
 

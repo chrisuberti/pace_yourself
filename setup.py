@@ -13,7 +13,7 @@ setup(
         'requests',
         'scipy',
         'scikit-learn',
-        'streamlit',
+        'streamlit>=1.52,<1.53',
         'python-dotenv',
         'psycopg[binary]>=3.2,<4',
         'cryptography>=44,<46',

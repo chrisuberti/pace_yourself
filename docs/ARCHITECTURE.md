@@ -2,12 +2,13 @@
 
 ## System Overview
 Pace Yourself is a Streamlit application for cycling course optimization. The
-active product architecture uses a guided workflow rail centered on a single
-runtime path.
+active product architecture uses a tab-styled workflow navigator centered on a
+single runtime path.
 
 ## Runtime Flow
 1. main.py starts the app and routes to Race Lab.
-2. pages_vibe/01_Race_Lab.py initializes session state and the workflow rail.
+2. pages_vibe/01_Race_Lab.py initializes session state, authentication, the
+   top workflow navigator, and the persistent setup summary.
 3. Workflow modules handle feature domains:
 - Course source/load and previews
 - Segmentation preview/apply
@@ -68,6 +69,11 @@ runtime path.
 - `pages_vibe/tabs/_workflow.py` owns workflow transitions and prerequisite checks.
 - `pages_vibe/tabs/_charts.py` contains pure Plotly figure builders with no
 	Streamlit calls.
+- The navigator updates only `vibe_active_step`; it is not a committed analysis
+  transition and renders exactly one workflow module per rerun.
+- Course, segmentation, rider, and optimization revisions define whether the
+  last successful result is current or stale. Stale results retain their rider
+  and course display context until a successful replacement or explicit reset.
 - Network calls and expensive calculations require explicit user actions.
 
 ## Persistence

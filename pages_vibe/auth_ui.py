@@ -11,6 +11,7 @@ from app.auth import (
     get_auth_store,
     get_authorization_url,
 )
+from pages_vibe.tabs import _workflow
 from pages_vibe.tabs.state import RIDER_DEFAULTS
 
 
@@ -86,8 +87,12 @@ def _bind_user_to_rider(user) -> None:
     rider = st.session_state.get('vibe_rider') or RIDER_DEFAULTS.copy()
     rider, switched_athlete = _rider_for_user(rider, user)
     if switched_athlete:
-        st.session_state.vibe_optimization_results = None
-    st.session_state.vibe_rider = rider
+        _workflow.mark_rider_profile(rider, force_revision=True)
+    else:
+        _workflow.mark_strava_identity({
+            'strava_athlete_id': rider.get('strava_athlete_id'),
+            'strava_name': rider.get('strava_name'),
+        })
 
 
 def _rider_for_user(rider, user):

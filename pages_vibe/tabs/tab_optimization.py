@@ -7,6 +7,9 @@ Streamlit-specific result layout.
 """
 from __future__ import annotations
 
+from types import SimpleNamespace
+
+import pandas as pd
 import streamlit as st
 
 from app.course import Course
@@ -27,25 +30,51 @@ from pages_vibe.tabs.state import (
 # ── Public entry point ──────────────────────────────────────────────────────
 
 def render() -> None:
-    if not _workflow.require_segmentation():
-        return
-
-    course: Course = get_course()
-    r = get_rider()
     results = get_results()
+    course: Course | None = get_course()
 
-    _render_controls(course, r, has_results=results is not None)
     if results is None:
+        if not _workflow.require_segmentation():
+            return
+        r = get_rider()
+        _render_controls(course, r, has_results=False)
         st.info("Review the rider and segmentation summary, then run the optimization.")
         return
 
+    stale = _workflow.results_are_stale()
+    if stale:
+        reasons = ", ".join(_workflow.stale_result_reasons())
+        st.warning(
+            f"**Inputs changed.** These results use the previous {reasons}. "
+            "They remain available until a new optimization succeeds."
+        )
+    else:
+        st.success("Results match the current committed inputs.")
+
+    if _workflow.can_run_optimization():
+        _render_controls(course, get_rider(), has_results=True)
+    else:
+        _render_reoptimization_gate()
+
+    result_rider = (
+        st.session_state.get('vibe_results_rider')
+        or get_rider()
+    )
+    result_course_df = st.session_state.get('vibe_results_course_df')
+    if result_course_df is None and course is not None:
+        result_course_df = course.df
+    result_course = SimpleNamespace(
+        df=result_course_df if result_course_df is not None else pd.DataFrame()
+    )
+
     st.divider()
-    _render_summary_metrics(results)
-    st.plotly_chart(_charts.build_results_chart(results, r, course),
+    _render_summary_metrics(results, result_rider)
+    st.plotly_chart(_charts.build_results_chart(
+                        results, result_rider, result_course),
                     width="stretch")
-    _render_pacing_card(results, r)
-    _render_strategy_table(results, r)
-    _render_export(results)
+    _render_pacing_card(results, result_rider)
+    _render_strategy_table(results, result_rider)
+    _render_export(results, stale=stale)
 
 
 # ── Controls ────────────────────────────────────────────────────────────────
@@ -59,6 +88,37 @@ def _render_controls(course: Course, r: dict, has_results: bool) -> None:
 
     if run_opt:
         _run_compare(course, r)
+
+
+def _render_reoptimization_gate() -> None:
+    """Keep stale results visible while directing the next required action."""
+    if get_course() is None:
+        message, label, step = (
+            "Load a course before re-optimizing.",
+            "Go to Course",
+            "course",
+        )
+    elif (
+        not st.session_state.get('vibe_segmentation_applied')
+        or not hasattr(get_course(), 'course_segments')
+        or get_course().course_segments is None
+        or get_course().course_segments.empty
+    ):
+        message, label, step = (
+            "Apply segmentation to the current course before re-optimizing.",
+            "Go to Segment",
+            "segment",
+        )
+    else:
+        message, label, step = (
+            "Complete the current rider setup before re-optimizing.",
+            "Go to Rider",
+            "rider",
+        )
+    st.info(message)
+    if st.button(label, type="primary", width="stretch"):
+        _workflow.set_active_step(step)
+        st.rerun()
 
 
 # ── Runners (split for clarity; _run_compare orchestrates) ──────────────────
@@ -146,7 +206,7 @@ def _run_compare(course: Course, r: dict) -> None:
 
 # ── Summary metrics ─────────────────────────────────────────────────────────
 
-def _render_summary_metrics(results: dict) -> None:
+def _render_summary_metrics(results: dict, r: dict) -> None:
     """Top metric row. Compare-both path shown when both strategies present."""
     has_c = 'constant' in results
     has_v = 'variable' in results
@@ -171,7 +231,6 @@ def _render_summary_metrics(results: dict) -> None:
                       delta_color="normal" if delta > 0 else "inverse")
         return
 
-    r = get_rider()
     if has_c:
         m1, m2, m3 = st.columns(3)
         with m1:
@@ -304,7 +363,7 @@ def _render_strategy_table(results: dict, r: dict) -> None:
 
 # ── Export ───────────────────────────────────────────────────────────────────
 
-def _render_export(results: dict) -> None:
+def _render_export(results: dict, *, stale: bool) -> None:
     has_c = 'constant' in results
     has_v = 'variable' in results
     if not (has_c or has_v):
@@ -312,8 +371,16 @@ def _render_export(results: dict) -> None:
 
     with st.expander("💾 Export"):
         ref_key = 'variable' if has_v else 'constant'
-        csv = results[ref_key]['detailed'].to_csv(index=False)
+        status = 'stale' if stale else 'current'
+        export_df = results[ref_key]['detailed'].copy()
+        export_df.insert(0, 'input_status', status)
+        csv = export_df.to_csv(index=False)
+        st.caption(
+            "Export status: inputs changed"
+            if stale
+            else "Export status: current inputs"
+        )
         st.download_button(
             "Download Detailed Results (CSV)", csv,
-            "race_lab_results.csv", "text/csv",
+            f"race_lab_results_{status}.csv", "text/csv",
             width="stretch")

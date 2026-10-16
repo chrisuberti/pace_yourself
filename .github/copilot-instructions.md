@@ -102,10 +102,11 @@ Domain-specific AI context lives under `skills/`. Load the relevant pack when wo
 - `skills/release-checklist/` — cut an MVP milestone
 
 ## Refactor Conventions (pages_vibe)
-- All session-state writes route through `pages_vibe/tabs/_workflow.py` (`mark_course_loaded`, `mark_segmentation_applied`, `mark_results`).
+- All committed workflow state writes route through `pages_vibe/tabs/_workflow.py` (`mark_course_loaded`, `mark_segmentation_applied`, `mark_rider_profile`, `mark_results`, `reset_analysis`).
 - Tab gating uses `_workflow.require_course() / require_segmentation() / require_results()`.
 - All Plotly figure construction lives in `pages_vibe/tabs/_charts.py` as pure builders (no `st.*` calls inside builders).
 - Tab modules expose only `render(...)`; helpers are `_private`.
+- Top navigation changes only `vibe_active_step` and renders one module; do not use native `st.tabs` for the four-step workflow.
 
 ## Common Patterns
 ```python

@@ -1,11 +1,12 @@
 import sympy as sp
 import numpy as np
 import matplotlib.pyplot as plt
-from scipy.optimize import root_scalar, curve_fit
+from scipy.optimize import root_scalar, lsq_linear
 import os, sys
-import sqlite3
 import unittest
 import traceback
+import json
+from datetime import datetime as dt_datetime, timezone
 from dotenv import load_dotenv
 load_dotenv()
 app_path = os.getenv('APP_PATH')
@@ -14,70 +15,196 @@ if app_path:
 
 from app.helpers import mps_to_mph  # Assuming this is defined in the helpers module
 from app.strava_calls import *
+from app.db import connect
+
+
+def _to_dt(value):
+    """Coerce an ISO string (or None/datetime) to datetime for TIMESTAMPTZ params."""
+    if value is None or isinstance(value, dt_datetime):
+        return value
+    try:
+        return dt_datetime.fromisoformat(str(value))
+    except (TypeError, ValueError):
+        return None
+
+
+def _iso(value):
+    """Render a datetime as an ISO string, preserving the prior string contract."""
+    return value.isoformat() if isinstance(value, dt_datetime) else value
+
+
+# rider_id holds the application user_id; ownership is scoped by that value
+# rather than a DDL foreign key so this store initializes independently.
+RIDER_SCHEMA_SQL = """
+CREATE TABLE IF NOT EXISTS rider_info (
+    rider_id TEXT PRIMARY KEY,
+    strava_athlete_id TEXT UNIQUE,
+    height DOUBLE PRECISION,
+    weight DOUBLE PRECISION,
+    bike_type TEXT,
+    position TEXT,
+    "CdA" DOUBLE PRECISION,
+    critical_power DOUBLE PRECISION,
+    "WTank" DOUBLE PRECISION,
+    athlete_first_name TEXT,
+    athlete_last_name TEXT,
+    athlete_profile_url TEXT,
+    strava_weight DOUBLE PRECISION,
+    strava_profile_checked_at TIMESTAMPTZ,
+    strava_last_synced_at TIMESTAMPTZ,
+    strava_lookback_days INTEGER,
+    strava_profile_json TEXT,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+CREATE TABLE IF NOT EXISTS best_efforts (
+    rider_id TEXT,
+    duration INTEGER,
+    power DOUBLE PRECISION,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    source TEXT DEFAULT 'unknown',
+    refreshed_at TIMESTAMPTZ,
+    PRIMARY KEY (rider_id, duration)
+);
+
+CREATE INDEX IF NOT EXISTS idx_best_efforts_rider ON best_efforts(rider_id);
+"""
+
+
+def fit_power_profile(best_efforts):
+    """Fit CP and W' from at least two valid power-duration efforts."""
+    efforts = {
+        int(duration): float(power)
+        for duration, power in (best_efforts or {}).items()
+        if duration and power and float(duration) > 0 and float(power) > 0
+    }
+    if len(efforts) < 2:
+        return None
+    sustained_efforts = {
+        duration: power for duration, power in efforts.items()
+        if (WTankCalculator.CP_FIT_MIN_DURATION
+            <= duration <= WTankCalculator.CP_FIT_MAX_DURATION)
+    }
+    if len(sustained_efforts) < 2:
+        return None
+
+    calculator = WTankCalculator(best_efforts=sustained_efforts)
+    w_prime = float(calculator.calculate_w_tank())
+    critical_power = float(calculator.critical_power)
+    if not np.isfinite(critical_power) or not np.isfinite(w_prime):
+        return None
+    if critical_power <= 0 or w_prime <= 0:
+        return None
+    return critical_power, w_prime
+
 
 def initialize_rider_database():
-    """Initialize the rider database with proper schema."""
-    db_path = os.path.join(os.path.dirname(os.path.dirname(__file__)), 'data', 'rider_data.db')
-    conn = sqlite3.connect(db_path)
-    c = conn.cursor()
-    
-    # Create best_efforts table
-    c.execute('''CREATE TABLE IF NOT EXISTS best_efforts (
-                    rider_id TEXT,
-                    duration INTEGER,
-                    power REAL,
-                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                    PRIMARY KEY (rider_id, duration)
-                )''')
-    
-    # Create rider_info table
-    c.execute('''CREATE TABLE IF NOT EXISTS rider_info (
-                    rider_id TEXT PRIMARY KEY,
-                    strava_athlete_id TEXT UNIQUE,
-                    height REAL,
-                    weight REAL,
-                    bike_type TEXT,
-                    position TEXT,
-                    CdA REAL,
-                    critical_power REAL,
-                    WTank REAL,
-                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-                )''')
-    
-    conn.commit()
-    conn.close()
-    print(f"Database initialized at: {db_path}")
+    """Ensure the rider tables exist (PostgreSQL)."""
+    with connect() as conn:
+        conn.execute(RIDER_SCHEMA_SQL)
+
+
+def get_cached_strava_rider(rider_id=None):
+    """Return cached Strava identity, provenance, and best efforts."""
+    initialize_rider_database()
+    with connect() as conn:
+        if rider_id:
+            row = conn.execute(
+                '''SELECT * FROM rider_info
+                   WHERE rider_id = %s AND strava_athlete_id IS NOT NULL''',
+                (str(rider_id),),
+            ).fetchone()
+        else:
+            row = conn.execute(
+                '''SELECT * FROM rider_info
+                   WHERE strava_athlete_id IS NOT NULL
+                   ORDER BY COALESCE(strava_last_synced_at, updated_at) DESC
+                   LIMIT 1'''
+            ).fetchone()
+        if row is None:
+            return None
+
+        profile = {key: _iso(value) for key, value in dict(row).items()}
+        effort_rows = conn.execute(
+            '''SELECT duration, power, source, refreshed_at
+               FROM best_efforts WHERE rider_id = %s ORDER BY duration''',
+            (row['rider_id'],),
+        ).fetchall()
+    profile['best_efforts'] = {
+        effort['duration']: effort['power'] for effort in effort_rows
+    }
+    profile['effort_source'] = (
+        effort_rows[0]['source'] if effort_rows else None)
+    profile['efforts_refreshed_at'] = (
+        _iso(effort_rows[0]['refreshed_at']) if effort_rows else None)
+    return profile
+
+
+def save_strava_profile(profile):
+    """Upsert authenticated athlete identity without refreshing power data."""
+    athlete_id = profile.get('id') if profile else None
+    if not athlete_id:
+        raise ValueError('Strava athlete profile did not include an ID.')
+
+    initialize_rider_database()
+    checked_at = dt_datetime.now(timezone.utc)
+    profile_weight = profile.get('weight')
+    profile_weight = (
+        float(profile_weight) if profile_weight not in (None, 0) else None)
+    profile_url = profile.get('profile_medium') or profile.get('profile')
+    with connect() as conn:
+        conn.execute(
+            '''INSERT INTO rider_info (
+                   rider_id, strava_athlete_id, athlete_first_name,
+                   athlete_last_name, athlete_profile_url, strava_weight,
+                   strava_profile_checked_at, strava_profile_json, updated_at
+               ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, NOW())
+               ON CONFLICT(rider_id) DO UPDATE SET
+                   strava_athlete_id = EXCLUDED.strava_athlete_id,
+                   athlete_first_name = EXCLUDED.athlete_first_name,
+                   athlete_last_name = EXCLUDED.athlete_last_name,
+                   athlete_profile_url = EXCLUDED.athlete_profile_url,
+                   strava_weight = EXCLUDED.strava_weight,
+                   strava_profile_checked_at = EXCLUDED.strava_profile_checked_at,
+                   strava_profile_json = EXCLUDED.strava_profile_json,
+                   updated_at = NOW()''',
+            (
+                str(athlete_id), str(athlete_id), profile.get('firstname'),
+                profile.get('lastname'), profile_url, profile_weight, checked_at,
+                json.dumps(profile),
+            ),
+        )
+    return get_cached_strava_rider(str(athlete_id))
 
 def get_all_riders():
     """Get information about all riders in the database."""
-    db_path = os.path.join(os.path.dirname(os.path.dirname(__file__)), 'data', 'rider_data.db')
     try:
-        conn = sqlite3.connect(db_path)
-        c = conn.cursor()
-        c.execute('''SELECT rider_id, strava_athlete_id, height, weight, bike_type, position, 
-                            critical_power, WTank, created_at, updated_at 
-                     FROM rider_info ORDER BY updated_at DESC''')
-        rows = c.fetchall()
-        conn.close()
-        
+        initialize_rider_database()
+        with connect() as conn:
+            rows = conn.execute(
+                '''SELECT rider_id, strava_athlete_id, height, weight, bike_type,
+                          position, critical_power, "WTank", created_at, updated_at
+                   FROM rider_info ORDER BY updated_at DESC'''
+            ).fetchall()
+
         riders = []
         for row in rows:
             rider_dict = {
-                'rider_id': row[0],
-                'strava_athlete_id': row[1],
-                'height': row[2],
-                'weight': row[3],
-                'bike_type': row[4],
-                'position': row[5],
-                'critical_power': row[6],
-                'WTank': row[7],
-                'created_at': row[8],
-                'updated_at': row[9]
+                'rider_id': row['rider_id'],
+                'strava_athlete_id': row['strava_athlete_id'],
+                'height': row['height'],
+                'weight': row['weight'],
+                'bike_type': row['bike_type'],
+                'position': row['position'],
+                'critical_power': row['critical_power'],
+                'WTank': row['WTank'],
+                'created_at': _iso(row['created_at']),
+                'updated_at': _iso(row['updated_at']),
             }
             riders.append(rider_dict)
         return riders
-    except sqlite3.Error as e:
+    except Exception as e:
         print(f"Database error: {e}")
         return []
 
@@ -107,7 +234,8 @@ class Rider:
     def __init__(self, height, weight, bike_type="Road", position="Hoods", 
                  rider_type=None, critical_power=None, 
                  best_efforts=None, 
-                 days=60, rider_id=None):
+                 days=60, rider_id=None, force_strava_refresh=False,
+                 auth_user_id=None):
         """
         Initialize a Rider with critical power and W' (WTank) calculated from one of three methods:
         
@@ -126,7 +254,7 @@ class Rider:
         
         Args:
             height: Rider height in meters
-            weight: Total weight in kg (rider + bike + gear)
+            weight: Rider body weight in kg
             bike_type: "Road", "TT", "Gravel", or "MTB"
             position: "Hoods", "Drops", "Aero", or "Flat"
             rider_type: For Method A - "time_trialist", "sprinter", or "all_rounder"
@@ -134,6 +262,8 @@ class Rider:
             best_efforts: For Method B - dict of {duration_seconds: power_watts}
             days: For Method C - number of days to look back in Strava (default 60)
             rider_id: Optional - used to cache/retrieve data from local database
+            force_strava_refresh: Bypass cached efforts and fetch Strava now
+            auth_user_id: Application user whose Strava token may be used
         """
         # Core physical attributes
         self.height = height
@@ -150,7 +280,16 @@ class Rider:
         
         # Rider identification
         self.rider_id = rider_id
+        self.auth_user_id = auth_user_id
         self.strava_athlete_id = None
+        self.athlete_profile = {}
+        self.athlete_first_name = None
+        self.athlete_last_name = None
+        self.athlete_profile_url = None
+        self.strava_weight = None
+        self.strava_last_synced_at = None
+        self.strava_lookback_days = None
+        self.best_efforts_source = None
         
         # ============================================================
         # METHOD A: Profile-based estimation (rider_type + critical_power)
@@ -180,7 +319,8 @@ class Rider:
         # First, try to get rider_id from Strava if not provided
         if not self.rider_id:
             try:
-                self.strava_athlete_id = get_athlete_id()
+                self._apply_strava_profile(get_athlete_profile(
+                    user_id=self.auth_user_id))
                 self.rider_id = str(self.strava_athlete_id)
                 print(f"Got Strava athlete ID: {self.rider_id}")
             except Exception as e:
@@ -191,7 +331,7 @@ class Rider:
         # Check if we have cached data in the database
         existing_rider_ids = self.get_existing_rider_ids()
         
-        if self.rider_id in existing_rider_ids:
+        if self.rider_id in existing_rider_ids and not force_strava_refresh:
             # Try to load from database
             if self.load_rider_info_from_db():
                 print(f"Method C: Loaded cached rider data for ID: {self.rider_id}")
@@ -213,14 +353,22 @@ class Rider:
         # No cached data - fetch from Strava API
         try:
             print(f"Method C: Fetching best efforts from Strava (last {days} days)...")
-            if not self.strava_athlete_id:
-                self.strava_athlete_id = get_athlete_id()
-                if not self.rider_id:
-                    self.rider_id = str(self.strava_athlete_id)
+            if not self.athlete_profile:
+                self._apply_strava_profile(get_athlete_profile(
+                    user_id=self.auth_user_id))
+            if not self.rider_id:
+                self.rider_id = str(self.strava_athlete_id)
             
             self.best_efforts = self.get_best_power_from_strava(days)
+            self.best_efforts = {
+                duration: power for duration, power in self.best_efforts.items()
+                if power and power > 0
+            }
             
-            if self.best_efforts:
+            if len(self.best_efforts) >= 2:
+                self.best_efforts_source = 'strava'
+                self.strava_lookback_days = days
+                self.strava_last_synced_at = dt_datetime.now(timezone.utc).isoformat()
                 self.WTank_calculator = WTankCalculator(best_efforts=self.best_efforts)
                 self.WTank = self.WTank_calculator.calculate_w_tank()
                 self.critical_power = self.WTank_calculator.critical_power
@@ -229,7 +377,7 @@ class Rider:
                 self.save_best_efforts_to_db()
                 print(f"Calculated and cached: CP={self.critical_power:.0f}W, W'={self.WTank:.0f}J")
             else:
-                print("No power data found in Strava activities")
+                print("Fewer than two usable power efforts found in Strava activities")
                 
         except Exception as e:
             print(f"Error fetching from Strava: {e}")
@@ -253,6 +401,20 @@ class Rider:
         adjusted_CdA = base_CdA * height_factor
 
         return round(adjusted_CdA, 3)
+
+    def _apply_strava_profile(self, profile):
+        """Attach authenticated Strava identity metadata to this rider."""
+        self.athlete_profile = profile or {}
+        self.strava_athlete_id = self.athlete_profile.get('id')
+        self.athlete_first_name = self.athlete_profile.get('firstname')
+        self.athlete_last_name = self.athlete_profile.get('lastname')
+        self.athlete_profile_url = (
+            self.athlete_profile.get('profile_medium')
+            or self.athlete_profile.get('profile')
+        )
+        profile_weight = self.athlete_profile.get('weight')
+        self.strava_weight = (
+            float(profile_weight) if profile_weight not in (None, 0) else None)
 
     def calculate_w_tank_from_profile(self, rider_type, critical_power):
         """
@@ -278,106 +440,137 @@ class Rider:
         Returns:
             dict of best efforts
         """
-        activities = get_activities(days)
-        durations = [30, 60, 120, 300, 1200, 60*30]  # Durations in seconds (30s, 1min, 2min, 5min, 20min, 30min)
-        return calculate_critical_power(activities, durations)
+        activities = get_activities(days, user_id=self.auth_user_id)
+        durations = [30, 60, 120, 300, 1200, 1800, 3600]
+        return calculate_critical_power(
+            activities, durations, user_id=self.auth_user_id)
 
     def save_best_efforts_to_db(self):
         """Save best efforts to a database."""
         if not hasattr(self, 'rider_id') or not self.rider_id:
             raise ValueError("Rider ID must be provided to save best efforts to the database.")
 
-        # Use data directory for database
-        db_path = os.path.join(os.path.dirname(os.path.dirname(__file__)), 'data', 'rider_data.db')
-        conn = sqlite3.connect(db_path)
-        c = conn.cursor()
-        
-        # Create tables if they don't exist
-        c.execute('''CREATE TABLE IF NOT EXISTS best_efforts (
-                        rider_id TEXT,
-                        duration INTEGER,
-                        power REAL,
-                        PRIMARY KEY (rider_id, duration)
-                    )''')
-        
-        c.execute('''CREATE TABLE IF NOT EXISTS rider_info (
-                        rider_id TEXT PRIMARY KEY,
-                        strava_athlete_id TEXT,
-                        height REAL,
-                        weight REAL,
-                        bike_type TEXT,
-                        position TEXT,
-                        CdA REAL,
-                        critical_power REAL,
-                        WTank REAL,
-                        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                        updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-                    )''')
+        initialize_rider_database()
+        synced_at = _to_dt(self.strava_last_synced_at)
+        with connect() as conn:
+            # Save best efforts
+            if hasattr(self, 'best_efforts') and self.best_efforts:
+                source = self.best_efforts_source or 'unknown'
+                for duration, power in self.best_efforts.items():
+                    conn.execute(
+                        '''INSERT INTO best_efforts
+                           (rider_id, duration, power, source, refreshed_at)
+                           VALUES (%s, %s, %s, %s, %s)
+                           ON CONFLICT(rider_id, duration) DO UPDATE SET
+                               power = EXCLUDED.power,
+                               source = EXCLUDED.source,
+                               refreshed_at = EXCLUDED.refreshed_at''',
+                        (self.rider_id, duration, power, source, synced_at),
+                    )
 
-        # Save best efforts
-        if hasattr(self, 'best_efforts'):
-            for duration, power in self.best_efforts.items():
-                c.execute('''INSERT OR REPLACE INTO best_efforts (rider_id, duration, power)
-                             VALUES (?, ?, ?)''', (self.rider_id, duration, power))
-
-        # Save rider info
-        strava_id = getattr(self, 'strava_athlete_id', None)
-        c.execute('''INSERT OR REPLACE INTO rider_info 
-                     (rider_id, strava_athlete_id, height, weight, bike_type, position, CdA, critical_power, WTank, updated_at)
-                     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)''', 
-                  (self.rider_id, strava_id, self.height, self.weight, self.bike_type, 
-                   self.position, self.CdA, self.critical_power, self.WTank))
-
-        conn.commit()
-        conn.close()
+            # Save rider info
+            strava_id = getattr(self, 'strava_athlete_id', None)
+            conn.execute(
+                '''INSERT INTO rider_info (
+                       rider_id, strava_athlete_id, height, weight, bike_type,
+                       position, "CdA", critical_power, "WTank", athlete_first_name,
+                       athlete_last_name, athlete_profile_url, strava_weight,
+                       strava_profile_checked_at, strava_last_synced_at,
+                       strava_lookback_days,
+                       strava_profile_json, updated_at
+                   ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s,
+                             NOW())
+                   ON CONFLICT(rider_id) DO UPDATE SET
+                       strava_athlete_id = EXCLUDED.strava_athlete_id,
+                       height = EXCLUDED.height,
+                       weight = EXCLUDED.weight,
+                       bike_type = EXCLUDED.bike_type,
+                       position = EXCLUDED.position,
+                       "CdA" = EXCLUDED."CdA",
+                       critical_power = EXCLUDED.critical_power,
+                       "WTank" = EXCLUDED."WTank",
+                       athlete_first_name = EXCLUDED.athlete_first_name,
+                       athlete_last_name = EXCLUDED.athlete_last_name,
+                       athlete_profile_url = EXCLUDED.athlete_profile_url,
+                       strava_weight = EXCLUDED.strava_weight,
+                       strava_profile_checked_at = EXCLUDED.strava_profile_checked_at,
+                       strava_last_synced_at = EXCLUDED.strava_last_synced_at,
+                       strava_lookback_days = EXCLUDED.strava_lookback_days,
+                       strava_profile_json = EXCLUDED.strava_profile_json,
+                       updated_at = NOW()''',
+                (
+                    self.rider_id, strava_id, self.height, self.weight,
+                    self.bike_type, self.position, self.CdA,
+                    self.critical_power, self.WTank, self.athlete_first_name,
+                    self.athlete_last_name, self.athlete_profile_url,
+                    self.strava_weight, synced_at,
+                    synced_at,
+                    self.strava_lookback_days,
+                    json.dumps(self.athlete_profile) if self.athlete_profile else None,
+                ),
+            )
 
     def load_best_efforts_from_db(self):
         """Load best efforts from a database."""
         if not hasattr(self, 'rider_id') or not self.rider_id:
             raise ValueError("Rider ID must be provided to load best efforts from the database.")
 
-        # Use data directory for database
-        db_path = os.path.join(os.path.dirname(os.path.dirname(__file__)), 'data', 'rider_data.db')
-        conn = sqlite3.connect(db_path)
-        c = conn.cursor()
-        c.execute('''SELECT duration, power FROM best_efforts WHERE rider_id = ?''', (self.rider_id,))
-        rows = c.fetchall()
-        conn.close()
+        with connect() as conn:
+            rows = conn.execute(
+                'SELECT duration, power FROM best_efforts WHERE rider_id = %s',
+                (self.rider_id,),
+            ).fetchall()
 
-        self.best_efforts = {duration: power for duration, power in rows}
+        self.best_efforts = {row['duration']: row['power'] for row in rows}
 
     def load_rider_info_from_db(self):
         """Load rider information from the database."""
         if not hasattr(self, 'rider_id') or not self.rider_id:
             raise ValueError("Rider ID must be provided to load rider info from the database.")
 
-        # Use data directory for database
-        db_path = os.path.join(os.path.dirname(os.path.dirname(__file__)), 'data', 'rider_data.db')
-        conn = sqlite3.connect(db_path)
-        c = conn.cursor()
-        c.execute('''SELECT strava_athlete_id, height, weight, bike_type, position, CdA, critical_power, WTank 
-                     FROM rider_info WHERE rider_id = ?''', (self.rider_id,))
-        row = c.fetchone()
-        conn.close()
+        initialize_rider_database()
+        with connect() as conn:
+            row = conn.execute(
+                '''SELECT strava_athlete_id, height, weight, bike_type,
+                          position, "CdA", critical_power, "WTank",
+                          athlete_first_name, athlete_last_name,
+                          athlete_profile_url, strava_weight,
+                          strava_profile_checked_at, strava_last_synced_at,
+                          strava_lookback_days,
+                          strava_profile_json
+                   FROM rider_info WHERE rider_id = %s''',
+                (self.rider_id,),
+            ).fetchone()
 
         if row:
-            (self.strava_athlete_id, self.height, self.weight, self.bike_type, 
-             self.position, self.CdA, self.critical_power, self.WTank) = row
+            self.strava_athlete_id = row['strava_athlete_id']
+            self.height = row['height']
+            self.weight = row['weight']
+            self.bike_type = row['bike_type']
+            self.position = row['position']
+            self.CdA = row['CdA']
+            self.critical_power = row['critical_power']
+            self.WTank = row['WTank']
+            self.athlete_first_name = row['athlete_first_name']
+            self.athlete_last_name = row['athlete_last_name']
+            self.athlete_profile_url = row['athlete_profile_url']
+            self.strava_weight = row['strava_weight']
+            self.strava_last_synced_at = _iso(row['strava_last_synced_at'])
+            self.strava_lookback_days = row['strava_lookback_days']
+            profile_json = row['strava_profile_json']
+            self.athlete_profile = json.loads(profile_json) if profile_json else {}
+            self.best_efforts_source = 'strava'
             return True
         return False
 
     def get_existing_rider_ids(self):
         """Get all existing rider IDs from the database."""
-        # Use data directory for database
-        db_path = os.path.join(os.path.dirname(os.path.dirname(__file__)), 'data', 'rider_data.db')
         try:
-            conn = sqlite3.connect(db_path)
-            c = conn.cursor()
-            c.execute('''SELECT rider_id FROM rider_info''')
-            rows = c.fetchall()
-            conn.close()
-            return [row[0] for row in rows]
-        except sqlite3.Error:
+            initialize_rider_database()
+            with connect() as conn:
+                rows = conn.execute('SELECT rider_id FROM rider_info').fetchall()
+            return [row['rider_id'] for row in rows]
+        except Exception:
             return []
 
     @staticmethod
@@ -426,6 +619,9 @@ class Rider:
                 f"Critical Power: {cp_display}, WTank: {wtank_display}")
 
 class WTankCalculator:
+    CP_FIT_MIN_DURATION = 120
+    CP_FIT_MAX_DURATION = 1800
+
     def __init__(self, rider_type=None, critical_power=None, best_efforts=None):
         """
         Initialize the WTankCalculator class.
@@ -536,9 +732,10 @@ class WTankCalculator:
     def _estimate_w_tank_from_curve(self):
         """Estimate W' based on the modified power-duration curve.
         
-        Only fits the CP+W'/t model to durations ≤ 3600s (the hyperbolic regime).
-        Longer durations follow the endurance decay model and should not influence
-        the CP/W' parameter estimation.
+        Fit CP+W'/t to sustained efforts from 2–30 minutes. Shorter efforts are
+        dominated by neuromuscular/anaerobic power and can push the asymptote
+        above observed long-duration power. Longer efforts follow the endurance
+        decay model and should not influence CP/W' estimation.
         """
         if not self.best_efforts:
             self._populate_best_efforts()  # Populate best efforts if not provided
@@ -546,22 +743,31 @@ class WTankCalculator:
         durations = np.array(list(self.best_efforts.keys()))
         powers = np.array(list(self.best_efforts.values()))
 
-        # Only fit CP+W'/t model to durations ≤ 1 hour
-        mask = durations <= 3600
+        mask = (
+            (durations >= self.CP_FIT_MIN_DURATION)
+            & (durations <= self.CP_FIT_MAX_DURATION)
+        )
         fit_durations = durations[mask]
         fit_powers = powers[mask]
 
         if len(fit_durations) < 2:
-            # Not enough short-duration data, use all
-            fit_durations = durations
-            fit_powers = powers
+            raise ValueError(
+                "At least two best efforts between 2 and 30 minutes are "
+                "required to estimate CP and W'.")
 
-        # Curve fitting with the hyperbolic model
-        popt, _ = curve_fit(
-            self._power_duration_model,
-            fit_durations,
-            fit_powers
+        cp_ceiling = np.nextafter(float(np.min(fit_powers)), 0.0)
+        design = np.column_stack((
+            np.ones_like(fit_durations, dtype=float),
+            1.0 / fit_durations,
+        ))
+        result = lsq_linear(
+            design,
+            fit_powers,
+            bounds=((0.0, 0.0), (cp_ceiling, np.inf)),
         )
+        if not result.success:
+            raise ValueError(f"CP/W' fit failed: {result.message}")
+        popt = result.x
         self.popt = popt  # Store the fitted parameters (CP, W_prime)
         estimated_cp, w_prime = popt
 
@@ -630,14 +836,14 @@ class WTankCalculator:
 
         return fig  # Return the figure object
 
-def calculate_critical_power(activities, durations):
+def calculate_critical_power(activities, durations, user_id=None):
     best_power = {duration: 0.0 for duration in durations}
 
     for activity in activities:
         activity_id = activity["id"]
 
         try:
-            power_stream = get_power_stream(activity_id)
+            power_stream = get_power_stream(activity_id, user_id=user_id)
         except Exception as e:
             print(f"Error processing activity {activity_id}: {e}")
             continue
@@ -655,13 +861,14 @@ def calculate_critical_power(activities, durations):
 
 
 
-def get_critical_power_profile(days=60):
+def get_critical_power_profile(days=60, user_id=None):
     try:
         print('Starting critical power profile calculation')
-        activities = get_activities(days)  # Retrieve activities from the past `days` days
+        activities = get_activities(days, user_id=user_id)
         print('Activities:', activities)
         durations = [15, 30, 60, 120, 300, 1200, 60*30, 60*60]  # Durations in seconds (5s, 30s, 1min, 5min, 20min)
-        critical_power = calculate_critical_power(activities, durations)
+        critical_power = calculate_critical_power(
+            activities, durations, user_id=user_id)
 
         print("Critical Power Profile:")
         for duration, power in critical_power.items():

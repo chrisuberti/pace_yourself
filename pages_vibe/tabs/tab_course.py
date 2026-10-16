@@ -1,23 +1,23 @@
 """
-Course Selection tab — load from database, upload CSV, or fetch from Strava.
+Course Selection tab — load from DB, upload CSV, or fetch from Strava.
 
-Also renders a GPS map + elevation profile for the loaded course.
+Chart construction (GPS map, elevation profile) lives in `_charts.py`.
+All session-state writes go through `_workflow.py`.
 """
+from __future__ import annotations
 
-import streamlit as st
 import pandas as pd
-import plotly.graph_objects as go
-import os
+import streamlit as st
 
 from app.course import Course
-from app.database import CourseDatabase
-from pages_vibe.tabs.state import get_course, get_rider
+from app.database import CourseDatabase, get_course_db
+from pages_vibe.tabs import _charts, _workflow
+from pages_vibe.tabs.state import get_course
 
 
-def render(db: CourseDatabase):
-    """Render the Course Selection tab content."""
+# ── Public entry point ──────────────────────────────────────────────────────
 
-    # ── Source selector + loader side-by-side ─────────────────────────────
+def render(db: CourseDatabase) -> None:
     col_source, col_loader = st.columns([1, 3])
 
     with col_source:
@@ -34,7 +34,6 @@ def render(db: CourseDatabase):
         else:
             _render_strava_fetch()
 
-    # ── Show loaded course overview ──────────────────────────────────────
     course = get_course()
     if course is None:
         st.info("Select a course above to get started.")
@@ -42,11 +41,14 @@ def render(db: CourseDatabase):
 
     st.divider()
     _render_course_overview(course)
+    if st.button("Continue to Segment", type="primary", width="stretch"):
+        _workflow.set_active_step('segment')
+        st.rerun()
 
 
-# ── Private helpers ─────────────────────────────────────────────────────────
-def _render_database_loader(db: CourseDatabase):
-    """Database course picker — auto-loads on selection change."""
+# ── Database loader ─────────────────────────────────────────────────────────
+
+def _render_database_loader(db: CourseDatabase) -> None:
     try:
         all_courses = db.list_courses()
     except Exception:
@@ -56,24 +58,35 @@ def _render_database_loader(db: CourseDatabase):
         st.info("No courses in the database yet. Upload a CSV or fetch from Strava.")
         return
 
-    labels = {}
+    labels: dict[str, str] = {}
     for c in all_courses:
         dist = c.get('total_distance_km', 0) or 0
         name = c.get('course_name', 'Unnamed')
         labels[f"{name} · {dist:.1f} km"] = c['course_id']
 
-    pick = st.selectbox("Select course", list(labels.keys()),
-                        index=0, label_visibility="collapsed")
-
-    selected_id = labels[pick]
     current_id = st.session_state.get('vibe_course_id')
+    current_index = 0
+    if current_id in labels.values():
+        current_index = list(labels.values()).index(current_id)
 
-    # Auto-load if selection differs from current or nothing loaded yet
-    if selected_id != current_id or get_course() is None:
-        _load_course_from_db(db, selected_id, pick)
+    with st.form("database_course_form"):
+        pick = st.selectbox(
+            "Select course",
+            list(labels.keys()),
+            index=current_index,
+            label_visibility="collapsed",
+        )
+        load_course = st.form_submit_button(
+            "Load Course",
+            type="primary",
+            width="stretch",
+        )
 
-def _load_course_from_db(db: CourseDatabase, course_id: str, label: str):
-    """Load course data from the database into session state."""
+    if load_course:
+        _load_course_from_db(db, labels[pick], pick)
+
+
+def _load_course_from_db(db: CourseDatabase, course_id: str, label: str) -> None:
     cdata = db.get_course(course_id)
     if not cdata:
         st.error("Course not found in database.")
@@ -93,50 +106,75 @@ def _load_course_from_db(db: CourseDatabase, course_id: str, label: str):
             st.error("No GPS data available for this course.")
             return
 
-        st.session_state.vibe_course = course
-        st.session_state.vibe_course_id = course_id
-        st.session_state.vibe_course_name = cdata.get('course_name', label)
-        st.session_state.vibe_segmentation_applied = False
-        st.session_state.vibe_optimization_results = None
+        _workflow.mark_course_loaded(
+            course=course,
+            course_id=course_id,
+            course_name=cdata.get('course_name', label),
+        )
         st.rerun()
     except Exception as e:
         st.error(f"Failed to load course: {e}")
 
 
-def _render_csv_upload():
-    """CSV file upload handler."""
-    uploaded = st.file_uploader("Course CSV", type=['csv'],
-                                label_visibility="collapsed")
-    csv_name = st.text_input("Course name", "Uploaded Course",
-                             label_visibility="collapsed",
-                             placeholder="Course name")
+# ── CSV upload ──────────────────────────────────────────────────────────────
 
-    if uploaded and st.button("Process Upload", type="primary",
-                              width="stretch"):
+def _render_csv_upload() -> None:
+    with st.form("csv_course_form"):
+        uploaded = st.file_uploader(
+            "Course CSV",
+            type=['csv'],
+            label_visibility="collapsed",
+        )
+        csv_name = st.text_input(
+            "Course name",
+            "Uploaded Course",
+            label_visibility="collapsed",
+            placeholder="Course name",
+        )
+        process_upload = st.form_submit_button(
+            "Process Upload",
+            type="primary",
+            width="stretch",
+        )
+
+    if process_upload:
+        if uploaded is None:
+            st.warning("Choose a CSV file before processing.")
+            return
         try:
             with st.spinner("Processing CSV…"):
                 df = pd.read_csv(uploaded)
                 course = Course(df)
-                st.session_state.vibe_course = course
-                st.session_state.vibe_course_id = None
-                st.session_state.vibe_course_name = csv_name
-                st.session_state.vibe_segmentation_applied = False
-                st.session_state.vibe_optimization_results = None
+                _workflow.mark_course_loaded(
+                    course=course, course_id=None, course_name=csv_name)
             st.toast(f"Loaded: {csv_name}")
             st.rerun()
         except Exception as e:
             st.error(f"Failed to process CSV: {e}")
 
-def _render_strava_fetch():
-    """Strava segment fetch handler — auto-fetches on ID entry."""
-    seg_id_input = st.text_input("Strava Segment ID", "",
-                                 label_visibility="collapsed",
-                                 placeholder="Strava segment ID (press Enter)")
 
-    if not seg_id_input:
+# ── Strava fetch ────────────────────────────────────────────────────────────
+
+def _render_strava_fetch() -> None:
+    with st.form("strava_course_form"):
+        seg_id_input = st.text_input(
+            "Strava Segment ID",
+            "",
+            label_visibility="collapsed",
+            placeholder="Strava segment ID",
+        )
+        fetch_segment = st.form_submit_button(
+            "Fetch Segment",
+            type="primary",
+            width="stretch",
+        )
+
+    if not fetch_segment:
+        return
+    if not seg_id_input.strip():
+        st.warning("Enter a Strava segment ID before fetching.")
         return
 
-    # Avoid re-fetching if this segment is already loaded
     last_fetched = st.session_state.get('_last_strava_seg_id')
     if last_fetched == seg_id_input.strip() and get_course() is not None:
         return
@@ -144,13 +182,15 @@ def _render_strava_fetch():
     try:
         with st.spinner("Fetching from Strava…"):
             from app.strava_calls import fetch_segment_data, fetch_segment_details
-            from app.database import get_course_db
 
-            details = fetch_segment_details(seg_id_input)
+            auth_user_id = st.session_state.get('auth_user_id')
+            details = fetch_segment_details(
+                seg_id_input, user_id=auth_user_id)
             seg_name = (details.get('name', f'Segment {seg_id_input}')
                         if details else f'Segment {seg_id_input}')
 
-            stream_data = fetch_segment_data(seg_id_input)
+            stream_data = fetch_segment_data(
+                seg_id_input, user_id=auth_user_id)
             if not (stream_data and stream_data.get('latlng')
                     and stream_data.get('altitude')):
                 st.error("No stream data returned from Strava.")
@@ -158,7 +198,6 @@ def _render_strava_fetch():
 
             latlng = stream_data['latlng']
             altitude_data = stream_data['altitude']
-
             if len(latlng) < 2:
                 st.error("Not enough GPS points in segment.")
                 return
@@ -172,34 +211,11 @@ def _render_strava_fetch():
                 df_raw.rename(columns={'ele': 'altitude'}, inplace=True)
 
             course = Course(df_raw)
+            course_id = _persist_strava_segment(seg_id_input, seg_name, raw_gps)
 
-            # ── Save to database (upsert by strava_segment_id) ───────
-            db = get_course_db()
-            strava_id = str(seg_id_input).strip()
-
-            # Check if segment already exists in DB
-            existing = db.conn.execute(
-                "SELECT course_id FROM courses WHERE strava_segment_id = ?",
-                (strava_id,)
-            ).fetchone()
-
-            if existing:
-                course_id = existing['course_id']
-            else:
-                course_id = db.store_course({
-                    'name': seg_name,
-                    'strava_segment_id': strava_id,
-                    'raw_gps_data': raw_gps,
-                    'created_by': 'strava',
-                    'course_type': 'strava_segment',
-                })
-
-            st.session_state.vibe_course = course
-            st.session_state.vibe_course_id = course_id
-            st.session_state.vibe_course_name = seg_name
-            st.session_state.vibe_segmentation_applied = False
-            st.session_state.vibe_optimization_results = None
-            st.session_state['_last_strava_seg_id'] = strava_id
+            _workflow.mark_course_loaded(
+                course=course, course_id=course_id, course_name=seg_name)
+            st.session_state['_last_strava_seg_id'] = str(seg_id_input).strip()
 
         st.toast(f"Fetched & saved: {seg_name}")
         st.rerun()
@@ -208,8 +224,23 @@ def _render_strava_fetch():
         st.info("Check your STRAVA_CLIENT_ID, STRAVA_CLIENT_SECRET, "
                 "and tokens in `.env`.")
 
-def _render_course_overview(course: Course):
-    """Show course metrics, GPS map, and elevation profile side-by-side."""
+
+def _persist_strava_segment(seg_id: str, seg_name: str, raw_gps: list) -> str:
+    """Upsert a Strava segment into the courses DB. Returns course_id."""
+    db = get_course_db()
+    strava_id = str(seg_id).strip()
+    return db.store_course({
+        'name': seg_name,
+        'strava_segment_id': strava_id,
+        'raw_gps_data': raw_gps,
+        'created_by': 'strava',
+        'course_type': 'strava_segment',
+    })
+
+
+# ── Overview ────────────────────────────────────────────────────────────────
+
+def _render_course_overview(course: Course) -> None:
     cdf = course.df
 
     total_dist_m = (cdf['cumulative_distance'].max()
@@ -228,111 +259,16 @@ def _render_course_overview(course: Course):
     with mc[3]:
         st.metric("Avg Grade", f"{avg_grad:.1f}%")
 
-    # ── Side-by-side: GPS map + elevation profile ────────────────────────
     has_latlon = 'lat' in cdf.columns and 'lon' in cdf.columns
-    has_elevation = ('cumulative_distance' in cdf.columns
-                     and 'altitude' in cdf.columns)
+    has_elev = ('cumulative_distance' in cdf.columns
+                and 'altitude' in cdf.columns)
 
-    if has_latlon and has_elevation:
+    if has_latlon and has_elev:
         col_map, col_elev = st.columns(2)
-
         with col_map:
-            _render_gps_map(cdf)
-
+            st.plotly_chart(_charts.build_gps_map(cdf), width="stretch")
         with col_elev:
-            _render_elevation_profile(cdf)
-
-    elif has_elevation:
-        _render_elevation_profile(cdf)
-
-
-def _render_gps_map(cdf: pd.DataFrame):
-    """Plotly Scattermapbox of the raw course GPS trace."""
-    fig = go.Figure()
-
-    # Color by gradient if available, else plain line
-    if 'gradient' in cdf.columns:
-        fig.add_trace(go.Scattermapbox(
-            lat=cdf['lat'], lon=cdf['lon'],
-            mode='markers+lines',
-            marker=dict(
-                size=4,
-                color=cdf['gradient'] * 100,
-                colorscale='RdYlGn_r',
-                cmin=-10, cmax=10,
-                colorbar=dict(title='Grade %', thickness=12, len=0.6),
-            ),
-            line=dict(width=2, color='gray'),
-            hovertemplate=(
-                'Lat: %{lat:.4f}<br>Lon: %{lon:.4f}<br>'
-                'Grade: %{marker.color:.1f}%<extra></extra>'
-            ),
-        ))
-    else:
-        fig.add_trace(go.Scattermapbox(
-            lat=cdf['lat'], lon=cdf['lon'],
-            mode='lines',
-            line=dict(width=3, color='#3498db'),
-        ))
-
-    center_lat = cdf['lat'].mean()
-    center_lon = cdf['lon'].mean()
-    lat_range = cdf['lat'].max() - cdf['lat'].min()
-    lon_range = cdf['lon'].max() - cdf['lon'].min()
-    max_range = max(lat_range, lon_range)
-    zoom = 15 if max_range < 0.01 else 13 if max_range < 0.05 else 12 if max_range < 0.1 else 10
-
-    fig.update_layout(
-        mapbox=dict(style='open-street-map',
-                    center=dict(lat=center_lat, lon=center_lon),
-                    zoom=zoom),
-        height=380,
-        margin=dict(l=0, r=0, t=0, b=0),
-        showlegend=False,
-    )
-    st.plotly_chart(fig, width="stretch")
-
-
-def _render_elevation_profile(cdf: pd.DataFrame):
-    """Simple elevation profile chart."""
-    dist_km = cdf['cumulative_distance'] / 1000
-
-    fig = go.Figure()
-
-    # Gradient-colored scatter on top of area fill
-    if 'gradient' in cdf.columns:
-        fig.add_trace(go.Scatter(
-            x=dist_km, y=cdf['altitude'],
-            fill='tozeroy', fillcolor='rgba(149,165,166,0.15)',
-            line=dict(color='rgba(149,165,166,0.4)', width=0.5),
-            showlegend=False, hoverinfo='skip',
-        ))
-        fig.add_trace(go.Scatter(
-            x=dist_km, y=cdf['altitude'],
-            mode='markers',
-            marker=dict(
-                size=3,
-                color=cdf['gradient'] * 100,
-                colorscale='RdYlGn_r',
-                cmin=-10, cmax=10,
-                showscale=False,
-            ),
-            hovertemplate='%{y:.0f}m · %{marker.color:.1f}%<extra></extra>',
-            showlegend=False,
-        ))
-    else:
-        fig.add_trace(go.Scatter(
-            x=dist_km, y=cdf['altitude'],
-            fill='tozeroy', fillcolor='rgba(149,165,166,0.3)',
-            line=dict(color='gray', width=1),
-            showlegend=False,
-            hovertemplate='%{y:.0f}m<extra></extra>',
-        ))
-
-    fig.update_layout(
-        height=380, template='plotly_dark',
-        xaxis_title='Distance (km)', yaxis_title='Elevation (m)',
-        margin=dict(l=50, r=20, t=10, b=40),
-        showlegend=False,
-    )
-    st.plotly_chart(fig, width="stretch")
+            st.plotly_chart(_charts.build_elevation_profile(cdf),
+                            width="stretch")
+    elif has_elev:
+        st.plotly_chart(_charts.build_elevation_profile(cdf), width="stretch")

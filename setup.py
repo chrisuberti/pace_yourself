@@ -15,6 +15,8 @@ setup(
         'scikit-learn',
         'streamlit',
         'python-dotenv',
+        'psycopg[binary]>=3.2,<4',
+        'cryptography>=44,<46',
         'sympy'
     ],
 )

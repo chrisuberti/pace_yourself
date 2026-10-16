@@ -9,23 +9,49 @@ consistent defaults regardless of which tab the user visits first.
 import streamlit as st
 
 # ── Default values ──────────────────────────────────────────────────────────
+BIKE_MASS_DEFAULTS = {
+    'Road': 8.5,
+    'TT': 9.5,
+    'Gravel': 10.5,
+    'MTB': 12.5,
+}
+
 RIDER_DEFAULTS = {
-    'weight': 80,
+    'height': 1.78,
+    'weight': 80.0,
+    'bike_type': 'Road',
+    'bike_mass': BIKE_MASS_DEFAULTS['Road'],
+    'position': 'Hoods',
     'critical_power': 250,
     'w_prime': 20000,
     'cda': 0.32,
     'crr': 0.004,
+    'strava_athlete_id': None,
+    'strava_name': None,
+    'strava_weight': None,
+    'strava_last_synced_at': None,
+    'strava_lookback_days': None,
+    'best_efforts': {},
+    'power_source': None,
 }
 
 SESSION_DEFAULTS = {
+    'auth_user_id': None,
+    'auth_user': None,
+    'oauth_state': None,
     'vibe_course': None,
     'vibe_course_id': None,
     'vibe_course_name': None,
     'vibe_segmentation_applied': False,
+    'vibe_segmentation_name': None,
+    'vibe_segmentation_params': None,
     'vibe_optimization_results': None,
+    'vibe_optimization_params': {},
     'vibe_rider': None,          # will be filled with RIDER_DEFAULTS copy
     'vibe_rider_obj': None,
-    'vibe_active_tab': 0,        # track active tab for stepper
+    'vibe_pending_rider_weight': None,
+    'vibe_rider_configured': True,
+    'vibe_active_step': 'course',
 }
 
 
@@ -55,60 +81,9 @@ def get_results():
     return st.session_state.get('vibe_optimization_results')
 
 
-# ── Stepper / workflow progress ──────────────────────────────────────────────
-TAB_LABELS_BASE = [
-    ("📂 Course",  1),   # complete when course loaded
-    ("🔪 Segment", 2),   # complete when segmentation applied
-    ("🚴 Rider",   3),   # complete when rider configured (always after seg)
-    ("🚀 Optimize", 4),  # complete when optimization results exist
-]
-
-
-def _completed_steps() -> int:
-    """Return number of completed workflow steps (0-4)."""
-    results = get_results()
-    if results is not None:
-        return 4
-    seg_applied = st.session_state.get('vibe_segmentation_applied', False)
-    if seg_applied:
-        return 2
-    course = get_course()
-    if course is not None:
-        return 1
-    return 0
-
-
-def get_tab_labels() -> list[str]:
-    """Return tab label strings with ✓ appended for completed steps."""
-    completed = _completed_steps()
-    labels = []
-    for base_label, threshold in TAB_LABELS_BASE:
-        if threshold <= completed:
-            labels.append(f"{base_label} ✓")
-        else:
-            labels.append(base_label)
-    return labels
-
-
-# Legacy — kept for backwards compatibility; no longer called from main page.
-def render_stepper():
-    """Show a horizontal progress indicator across the top of Race Lab."""
-    completed = _completed_steps()
-    WORKFLOW_STEPS = [
-        ("Load Course", "📂"),
-        ("Segment", "🔪"),
-        ("Rider Setup", "🚴"),
-        ("Optimize", "🚀"),
-    ]
-    cols = st.columns(len(WORKFLOW_STEPS))
-    for i, (label, icon) in enumerate(WORKFLOW_STEPS):
-        with cols[i]:
-            if i < completed:
-                st.markdown(f"<div style='text-align:center;opacity:0.5'>{icon} <s>{label}</s> ✓</div>",
-                            unsafe_allow_html=True)
-            elif i == completed:
-                st.markdown(f"<div style='text-align:center;font-weight:bold'>{icon} <u>{label}</u></div>",
-                            unsafe_allow_html=True)
-            else:
-                st.markdown(f"<div style='text-align:center;opacity:0.35'>{icon} {label}</div>",
-                            unsafe_allow_html=True)
+WORKFLOW_STEPS = (
+    ('course', 'Course'),
+    ('segment', 'Segment'),
+    ('rider', 'Rider'),
+    ('optimize', 'Optimize'),
+)

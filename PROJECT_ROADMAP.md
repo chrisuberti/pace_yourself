@@ -1,5 +1,12 @@
 # Pace Yourself - Project Analysis & Strategic Roadmap
 
+> Strategic document only.
+> For active MVP execution status, use docs/STATUS_MVP.md.
+> October 2026 consolidation: the canonical guided Streamlit workflow and
+> PostgreSQL storage are implemented. Multi-user ownership/backfill validation
+> and the remaining UX phases are still deployment gates; historical
+> "production-ready" claims below are not a release sign-off.
+
 *Comprehensive review and development plan for the cycling performance optimization platform*
 
 ---
@@ -306,11 +313,14 @@ CREATE TABLE user_sessions (
 #### 5. **User Management & Authentication** 👤
 **Priority**: MEDIUM
 ```python
-# File: app/auth.py (TO CREATE)
-# Integration with Strava OAuth for seamless user experience
+# app/auth.py and app/auth_store.py implement the per-user OAuth/token boundary.
+# Continue moving all remaining persistence and ownership to PostgreSQL.
 
 Features needed:
-- Strava OAuth integration for login
+- Strava authorize/callback flow for login
+- Encrypted token storage keyed by athlete ID
+- Session-bound athlete identity and data ownership
+- Logout and switch-account controls
 - User profile management
 - Session persistence across browser sessions
 - Multi-user support in Streamlit

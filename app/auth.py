@@ -1,63 +1,155 @@
+"""Per-user Strava OAuth and token refresh orchestration."""
+
+from __future__ import annotations
+
+import hmac
 import os
+import secrets
+import time
+from functools import lru_cache
+from urllib.parse import urlencode
+
 import requests
 from dotenv import load_dotenv
-import time
 
-load_dotenv()  # Load environment variables
+from app.auth_store import PostgresAuthStore
 
-# Retrieve initial values from .env
-# Support both naming conventions (STRAVA_CLIENT_ID or client_id)
-client_id = os.getenv("STRAVA_CLIENT_ID") or os.getenv("client_id")
-client_secret = os.getenv("STRAVA_CLIENT_SECRET") or os.getenv("client_secret")
-refresh_token = os.getenv("refresh_token")
-expires_at = int(os.getenv("expires_at") or 0)
-access_token = os.getenv("access_token")
+load_dotenv()
+
+STRAVA_AUTHORIZE_URL = 'https://www.strava.com/oauth/authorize'
+STRAVA_TOKEN_URL = 'https://www.strava.com/oauth/token'
+STRAVA_SCOPE = 'read,profile:read_all,activity:read_all'
+
+# OAuth state must survive the full-page redirect to Strava and back. Streamlit
+# discards session_state across that round trip (the callback arrives as a new
+# session), so issued states are tracked server-side with a short TTL instead.
+_ISSUED_OAUTH_STATES: dict[str, float] = {}
+_OAUTH_STATE_TTL_SECONDS = 600
 
 
-# Token refresh function
-def refresh_access_token():
-    global access_token, refresh_token, expires_at
+def _prune_oauth_states():
+    now = time.time()
+    for value, expiry in list(_ISSUED_OAUTH_STATES.items()):
+        if expiry < now:
+            _ISSUED_OAUTH_STATES.pop(value, None)
 
-    # Define the token refresh endpoint and payload
-    url = "https://www.strava.com/oauth/token"
-    payload = {
-        "client_id": client_id,
-        "client_secret": client_secret,
-        "grant_type": "refresh_token",
-        "refresh_token": refresh_token
-    }
 
-    # Make the POST request to refresh the token
-    response = requests.post(url, data=payload)
-    if response.status_code == 200:
-        token_data = response.json()
-        access_token = token_data["access_token"]
-        refresh_token = token_data["refresh_token"]
-        expires_at = token_data["expires_at"]
-        
-        # Update the .env file with new tokens
-        update_env_file("access_token", access_token)
-        update_env_file("refresh_token", refresh_token)
-        update_env_file("expires_at", str(expires_at))
-        print(response.json())
-        print("Access token refreshed.")
-    else:
-        raise Exception("Failed to refresh token: ", response.text)
+def _consume_oauth_state(state) -> bool:
+    """Return True and invalidate the state if it was issued and unexpired."""
+    _prune_oauth_states()
+    return bool(state) and _ISSUED_OAUTH_STATES.pop(str(state), None) is not None
 
-# Update .env file with new token values
-def update_env_file(key, value):
-    with open(".env", "r") as file:
-        lines = file.readlines()
-    with open(".env", "w") as file:
-        for line in lines:
-            if line.startswith(f"{key}="):
-                file.write(f"{key}={value}\n")
-            else:
-                file.write(line)
 
-# Get a valid token (refresh if needed)
-def get_access_token():
-    global expires_at
-    if time.time() > expires_at - 300:
-        refresh_access_token()
-    return access_token
+
+class AuthenticationRequired(RuntimeError):
+    """Raised when a Strava operation has no authenticated application user."""
+
+
+def _setting(name):
+    value = os.getenv(name)
+    if not value:
+        raise RuntimeError(f'{name} is required for Strava authentication.')
+    return value
+
+
+def authentication_configured():
+    required = (
+        'DATABASE_URL', 'TOKEN_ENCRYPTION_KEY', 'STRAVA_CLIENT_ID',
+        'STRAVA_CLIENT_SECRET', 'STRAVA_REDIRECT_URI',
+    )
+    return all(os.getenv(name) for name in required)
+
+
+@lru_cache(maxsize=1)
+def get_auth_store():
+    store = PostgresAuthStore()
+    store.initialize_schema()
+    return store
+
+
+def create_oauth_state():
+    _prune_oauth_states()
+    state = secrets.token_urlsafe(32)
+    _ISSUED_OAUTH_STATES[state] = time.time() + _OAUTH_STATE_TTL_SECONDS
+    return state
+
+
+def get_authorization_url(state):
+    query = urlencode({
+        'client_id': _setting('STRAVA_CLIENT_ID'),
+        'redirect_uri': _setting('STRAVA_REDIRECT_URI'),
+        'response_type': 'code',
+        'approval_prompt': 'auto',
+        'scope': STRAVA_SCOPE,
+        'state': state,
+    })
+    return f'{STRAVA_AUTHORIZE_URL}?{query}'
+
+
+def complete_oauth(code, returned_state, expected_state=None, store=None):
+    """Validate callback state, exchange code, and persist the user grant."""
+    # Prefer the server-side issued-state store (survives the redirect); fall
+    # back to the per-session expected_state when present.
+    state_ok = _consume_oauth_state(returned_state)
+    if not state_ok and expected_state and returned_state:
+        state_ok = hmac.compare_digest(str(returned_state), str(expected_state))
+    if not state_ok:
+        raise ValueError('Invalid OAuth state. Start the Strava login again.')
+
+    response = requests.post(
+        STRAVA_TOKEN_URL,
+        data={
+            'client_id': _setting('STRAVA_CLIENT_ID'),
+            'client_secret': _setting('STRAVA_CLIENT_SECRET'),
+            'code': code,
+            'grant_type': 'authorization_code',
+        },
+        timeout=15,
+    )
+    if response.status_code != 200:
+        raise RuntimeError(
+            f'Strava token exchange failed ({response.status_code}).')
+    token_data = response.json()
+    athlete = token_data.get('athlete')
+    if not athlete:
+        raise RuntimeError('Strava token exchange did not return an athlete.')
+    return (store or get_auth_store()).save_oauth_grant(athlete, token_data)
+
+
+def refresh_access_token(user_id, store=None):
+    """Refresh and persist one user's Strava token without touching `.env`."""
+    if not user_id:
+        raise AuthenticationRequired('Connect a Strava account first.')
+    token_store = store or get_auth_store()
+    current = token_store.get_token(user_id)
+    if not current:
+        raise AuthenticationRequired('No Strava token exists for this user.')
+
+    response = requests.post(
+        STRAVA_TOKEN_URL,
+        data={
+            'client_id': _setting('STRAVA_CLIENT_ID'),
+            'client_secret': _setting('STRAVA_CLIENT_SECRET'),
+            'grant_type': 'refresh_token',
+            'refresh_token': current['refresh_token'],
+        },
+        timeout=15,
+    )
+    if response.status_code != 200:
+        raise RuntimeError(f'Strava token refresh failed ({response.status_code}).')
+    refreshed = response.json()
+    token_store.update_token(user_id, refreshed)
+    return refreshed['access_token']
+
+
+def get_access_token(user_id, store=None):
+    """Return a valid access token belonging only to `user_id`."""
+    if not user_id:
+        raise AuthenticationRequired('Connect a Strava account first.')
+    token_store = store or get_auth_store()
+    token = token_store.get_token(user_id)
+    if not token:
+        raise AuthenticationRequired('No Strava token exists for this user.')
+    if time.time() > token['expires_at'] - 300:
+        return refresh_access_token(user_id, store=token_store)
+    return token['access_token']

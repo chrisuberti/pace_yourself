@@ -2,7 +2,7 @@ import pandas as pd
 import numpy as np
 from scipy.signal import savgol_filter
 from scipy.spatial.distance import pdist, squareform
-from sklearn.cluster import AgglomerativeClustering
+from sklearn.cluster import AgglomerativeClustering, KMeans
 import matplotlib.pyplot as plt
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
@@ -22,6 +22,46 @@ TERRAIN_COLORS = {
     'flat': '#95a5a6',        # gray
     'downhill': '#e74c3c'     # red
 }
+
+# Gradient "pacing zones": a handful of recurring gradient types so the
+# optimizer solves only a few power knobs and the rider gets a digestible rule
+# ("hammer steep climbs, settle on flats, recover on descents"). Each band has
+# a stable rank used as the segment_id, a human label, and a dark-theme color.
+BAND_RANK = {
+    'steep_descent': 0,
+    'descent': 1,
+    'flat': 2,
+    'climb': 3,
+    'steep_climb': 4,
+}
+BAND_LABELS = {
+    'steep_descent': 'Steep Descent',
+    'descent': 'Descent',
+    'flat': 'Flat / Rolling',
+    'climb': 'Climb',
+    'steep_climb': 'Steep Climb',
+}
+BAND_COLORS = {
+    'steep_descent': '#17becf',  # cyan
+    'descent': '#1f77b4',        # blue
+    'flat': '#95a5a6',           # gray
+    'climb': '#ff7f0e',          # orange
+    'steep_climb': '#d62728',    # red
+}
+
+
+def classify_gradient_band(gradient_pct, flat_threshold=2.0, steep_threshold=6.0):
+    """Map a gradient (in %) to one of the five pacing-zone band names."""
+    if gradient_pct > steep_threshold:
+        return 'steep_climb'
+    if gradient_pct > flat_threshold:
+        return 'climb'
+    if gradient_pct >= -flat_threshold:
+        return 'flat'
+    if gradient_pct >= -steep_threshold:
+        return 'descent'
+    return 'steep_descent'
+
 
 SEGMENT_COLORSCALE = [
     '#1f77b4', '#ff7f0e', '#2ca02c', '#d62728', '#9467bd',
@@ -265,7 +305,8 @@ class Course:
                  smoothing_min_window: int = 51,
                  smoothing_max_window: int = 101,
                  smoothing_polyorder: int = 2,
-                 max_gradient: float = 25.0):
+                 max_gradient: float = 25.0,
+                 gradient_window_distance: float = 50.0):
         """
         Initialize a Course object.
         
@@ -278,6 +319,9 @@ class Course:
             smoothing_max_window: Maximum number of points for smoothing window (default: 101)
             smoothing_polyorder: Polynomial order for Savitzky-Golay filter (default: 2)
             max_gradient: Maximum allowed gradient in percent, values beyond are clamped (default: 25%)
+            gradient_window_distance: Half-width in meters of the distance window used to
+                                      compute gradient as rise/run (default: 50m -> 100m window).
+                                      Avoids dividing by tiny per-point GPS distances.
         """
         self.df = df.copy()
         
@@ -287,6 +331,7 @@ class Course:
         self.smoothing_max_window = smoothing_max_window
         self.smoothing_polyorder = smoothing_polyorder
         self.max_gradient = max_gradient
+        self.gradient_window_distance = gradient_window_distance
         
         if skip_processing:
             # Data already processed - just validate required columns exist
@@ -362,13 +407,51 @@ class Course:
         self.df["height_gain"] = self.df["altitude"].diff().clip(lower=0)  # Use raw for actual gain
         self.df["height_loss"] = -self.df["altitude"].diff().clip(upper=0)
         
-        # Handle inf values in the gradient and set them to zero
-        self.df["gradient"] = (self.df["delta_altitude"] / self.df["distance"]) * 100
+        # Gradient as rise/run over a fixed DISTANCE window, not point-to-point.
+        # Point-to-point division by tiny GPS steps (some <0.5 m) produced spikes
+        # of hundreds of percent that were then hard-clamped to ±max_gradient,
+        # destroying terrain detail. A centered distance window is robust.
+        self.df["gradient"] = self._windowed_gradient(
+            self.df["cumulative_distance"].to_numpy(),
+            self.df["altitude_smoothed"].to_numpy(),
+            self.gradient_window_distance,
+        )
         self.df["gradient"] = self.df["gradient"].fillna(0)
         self.df['gradient'] = self.df['gradient'].replace([np.inf, -np.inf], 0)
         
         # Clamp gradient to realistic values
         self.df['gradient'] = self.df['gradient'].clip(lower=-self.max_gradient, upper=self.max_gradient)
+
+
+    @staticmethod
+    def _windowed_gradient(cum_dist, altitude, half_window_m):
+        """Compute gradient (%) as rise/run over a centered distance window.
+
+        For each point i, find the points roughly half_window_m metres behind and
+        ahead (by cumulative distance) and take slope = Δaltitude / Δdistance. This
+        avoids dividing altitude changes by near-zero per-point GPS distances.
+
+        Args:
+            cum_dist: 1-D array of cumulative distance in metres (monotonic).
+            altitude: 1-D array of (smoothed) altitude in metres.
+            half_window_m: Half-width of the window in metres.
+
+        Returns:
+            1-D numpy array of gradients in percent.
+        """
+        n = len(altitude)
+        grad = np.zeros(n)
+        if n < 2:
+            return grad
+        lo = np.searchsorted(cum_dist, cum_dist - half_window_m, side='left')
+        hi = np.searchsorted(cum_dist, cum_dist + half_window_m, side='right') - 1
+        np.clip(hi, 0, n - 1, out=hi)
+        for i in range(n):
+            a, b = lo[i], hi[i]
+            run = cum_dist[b] - cum_dist[a]
+            if run > 1.0:  # guard against degenerate windows (overlapping points)
+                grad[i] = (altitude[b] - altitude[a]) / run * 100.0
+        return grad
 
 
     def calculate_bearing(self):
@@ -636,15 +719,197 @@ class Course:
             .ffill()  # Fill the end of the DataFrame
         )
 
-    def auto_segmentation(self, max_clusters=10, gradient_weight=1.0, bearing_weight=1.0, smoothing_window=5):
+    @staticmethod
+    def _merge_short_runs(df, min_segment_distance, seg_col='segment',
+                          dist_col='distance', preserve_labels=False):
+        """Merge contiguous runs shorter than `min_segment_distance` into a neighbor.
+
+        Clustering assigns a cluster *label* to every point with no contiguity
+        constraint, so labels flip back and forth and produce dozens of tiny
+        spatial fragments. This absorbs each sub-threshold contiguous run into
+        its longer adjacent run (relabeling those points), iterating from the
+        shortest run until none remain below the threshold.
+
+        Returns the updated segment-label Series (does not mutate `df`).
+        """
+        labels = df[seg_col].to_numpy().copy()
+        distances = df[dist_col].to_numpy()
+
+        while True:
+            # Identify contiguous runs of identical label.
+            boundaries = np.concatenate(([True], labels[1:] != labels[:-1]))
+            run_ids = np.cumsum(boundaries) - 1
+            n_runs = run_ids[-1] + 1
+            if n_runs <= 1:
+                break
+
+            run_dist = np.array([distances[run_ids == r].sum() for r in range(n_runs)])
+            short_runs = np.flatnonzero(run_dist < min_segment_distance)
+            if preserve_labels:
+                run_labels = np.array([
+                    labels[run_ids == run_id][0]
+                    for run_id in range(n_runs)
+                ])
+                label_run_counts = {
+                    label: int((run_labels == label).sum())
+                    for label in np.unique(run_labels)
+                }
+                short_runs = np.array([
+                    run_id for run_id in short_runs
+                    if label_run_counts[run_labels[run_id]] > 1
+                ], dtype=int)
+
+            if len(short_runs) == 0:
+                break
+
+            smallest = int(short_runs[np.argmin(run_dist[short_runs])])
+
+            # Choose the neighbor to merge into: prefer the longer adjacent run.
+            prev_run = smallest - 1 if smallest > 0 else None
+            next_run = smallest + 1 if smallest < n_runs - 1 else None
+            if prev_run is None:
+                target = next_run
+            elif next_run is None:
+                target = prev_run
+            else:
+                target = prev_run if run_dist[prev_run] >= run_dist[next_run] else next_run
+
+            target_label = labels[run_ids == target][0]
+            labels[run_ids == smallest] = target_label
+
+        return pd.Series(labels, index=df.index)
+
+    @staticmethod
+    def _clustering_window_points(df, smoothing_window, smoothing_distance):
+        """Convert a rider-facing smoothing distance to an odd point window."""
+        if smoothing_distance is None:
+            points = int(smoothing_window)
+        else:
+            positive_distances = df.loc[df['distance'] > 0, 'distance']
+            median_spacing = positive_distances.median()
+            if not np.isfinite(median_spacing) or median_spacing <= 0:
+                median_spacing = 1.0
+            points = int(round(float(smoothing_distance) / median_spacing))
+
+        points = max(1, points)
+        if points % 2 == 0:
+            points += 1
+        return points
+
+    def _cluster_course_types(self, df, max_clusters, gradient_weight,
+                              bearing_weight, smoothing_window,
+                              min_segment_distance, smoothing_distance,
+                              gradient_clip):
+        """Assign recurring terrain-type labels from gradient and bearing."""
+        if max_clusters < 2:
+            raise ValueError("At least two cluster types are required.")
+        if gradient_weight < 0 or bearing_weight < 0:
+            raise ValueError("Clustering weights cannot be negative.")
+        if gradient_weight + bearing_weight <= 0:
+            raise ValueError("Gradient or bearing must have a non-zero weight.")
+        if gradient_clip <= 0:
+            raise ValueError("Gradient cap must be positive.")
+
+        result = df.copy().sort_values('cumulative_distance').reset_index(drop=True)
+        window_points = self._clustering_window_points(
+            result, smoothing_window, smoothing_distance)
+
+        gradient = pd.to_numeric(result['gradient'], errors='coerce')
+        gradient = gradient.interpolate(limit_direction='both').fillna(0.0)
+        gradient_smoothed = gradient.rolling(
+            window=window_points, center=True, min_periods=1).mean()
+        gradient_smoothed = gradient_smoothed.clip(-gradient_clip, gradient_clip)
+
+        bearing = pd.to_numeric(result['bearing'], errors='coerce')
+        bearing = bearing.interpolate(limit_direction='both').fillna(0.0)
+        bearing_radians = np.radians(bearing.to_numpy())
+        bearing_sin = pd.Series(np.sin(bearing_radians)).rolling(
+            window=window_points, center=True, min_periods=1).mean()
+        bearing_cos = pd.Series(np.cos(bearing_radians)).rolling(
+            window=window_points, center=True, min_periods=1).mean()
+        bearing_smoothed = np.mod(
+            np.degrees(np.arctan2(bearing_sin, bearing_cos)), 360.0)
+
+        gradient_iqr = (
+            gradient_smoothed.quantile(0.75)
+            - gradient_smoothed.quantile(0.25)
+        )
+        gradient_scale = max(float(gradient_iqr) / 1.349, 0.25)
+        gradient_standardized = (
+            gradient_smoothed - gradient_smoothed.median()
+        ) / gradient_scale
+
+        total_weight = gradient_weight + bearing_weight
+        normalized_gradient_weight = gradient_weight / total_weight
+        normalized_bearing_weight = bearing_weight / total_weight
+        bearing_radians_smoothed = np.radians(bearing_smoothed)
+        features = np.column_stack([
+            gradient_standardized * np.sqrt(normalized_gradient_weight),
+            np.sin(bearing_radians_smoothed)
+            * np.sqrt(normalized_bearing_weight / 2.0),
+            np.cos(bearing_radians_smoothed)
+            * np.sqrt(normalized_bearing_weight / 2.0),
+        ])
+
+        unique_feature_count = len(np.unique(np.round(features, 8), axis=0))
+        cluster_count = min(int(max_clusters), len(result), unique_feature_count)
+        if cluster_count < 2:
+            raise ValueError("Course does not contain enough terrain variation to cluster.")
+
+        labels = KMeans(
+            n_clusters=cluster_count,
+            n_init=20,
+            random_state=42,
+        ).fit_predict(features)
+
+        label_gradients = pd.DataFrame({
+            'label': labels,
+            'gradient': gradient_smoothed,
+        }).groupby('label')['gradient'].mean().sort_values()
+        label_order = {old_label: new_label for new_label, old_label
+                       in enumerate(label_gradients.index)}
+        result['segment'] = pd.Series(labels).map(label_order).astype(int)
+        result['gradient_smoothed'] = gradient_smoothed
+        result['bearing_smoothed'] = bearing_smoothed
+
+        if min_segment_distance and min_segment_distance > 0:
+            result['segment'] = self._merge_short_runs(
+                result,
+                min_segment_distance,
+                preserve_labels=True,
+            )
+
+        final_gradients = result.groupby('segment')['gradient_smoothed'].mean().sort_values()
+        final_order = {old_label: new_label for new_label, old_label
+                       in enumerate(final_gradients.index)}
+        result['segment'] = result['segment'].map(final_order).astype(int)
+        terrain_by_label = result.groupby('segment')['gradient_smoothed'].mean().map(
+            classify_gradient_band)
+        result['segment_terrain'] = result['segment'].map(terrain_by_label)
+        result.attrs['requested_clusters'] = int(max_clusters)
+        result.attrs['actual_clusters'] = int(result['segment'].nunique())
+        result.attrs['smoothing_window_points'] = window_points
+        return result
+
+    def auto_segmentation(self, max_clusters=10, gradient_weight=1.0, bearing_weight=1.0,
+                          smoothing_window=5, min_segment_distance=200.0,
+                          smoothing_distance=None, gradient_clip=12.0):
         """
         Automatically segment the course into clusters based on gradient and bearing.
 
         Args:
-            max_clusters (int): Maximum number of clusters to create.
+            max_clusters (int): Requested number of recurring terrain types.
             gradient_weight (float): Weight for the gradient feature.
             bearing_weight (float): Weight for the bearing feature.
-            smoothing_window (int): Window size for smoothing gradient and bearing data.
+            smoothing_window (int): Legacy point-based smoothing window. Used
+                only when smoothing_distance is None.
+            min_segment_distance (float): Minimum contiguous-run length in meters.
+                Runs shorter than this are merged into a neighbor to avoid
+                hundreds of tiny spatial fragments (set to 0 to disable).
+            smoothing_distance (float): Distance in meters over which gradient
+                and bearing are smoothed. Preferred over smoothing_window.
+            gradient_clip (float): Symmetric percent-grade cap applied after
+                smoothing so GPS spikes cannot become singleton clusters.
         """
         # Clear existing segmentation data to prevent accumulation
         if 'segment' in self.df.columns:
@@ -656,61 +921,16 @@ class Course:
         if hasattr(self, 'course_segments_aggregated'):
             delattr(self, 'course_segments_aggregated')
         
-        def normalize_bearing(bearing):
-            return np.radians(bearing)
-
-        def compute_custom_distance(point_a, point_b):
-            """
-            Custom distance metric that considers gradient and bearing.
-            Args:
-                point_a: Tuple (gradient, bearing).
-                point_b: Tuple (gradient, bearing).
-            Returns:
-                float: Weighted distance between the two points.
-            """
-            grad_a, bear_a = point_a
-            grad_b, bear_b = point_b
-
-            # Normalize gradient difference
-            grad_diff = abs(grad_a - grad_b)
-
-            # Normalize bearing difference (handle circularity)
-            bear_diff = abs(np.arctan2(np.sin(bear_a - bear_b), np.cos(bear_a - bear_b)))
-
-            # Adjust weights based on gradient
-            if abs(grad_a) > 2 or abs(grad_b) > 2:  # High gradient scenario
-                grad_weight = gradient_weight * 1.5
-                bear_weight = bearing_weight * 0.5
-            else:  # Flat scenario
-                grad_weight = gradient_weight * 0.5
-                bear_weight = bearing_weight * 1.5
-
-            return grad_weight * grad_diff + bear_weight * bear_diff
-
-        # Smooth gradient and bearing columns (clear any existing smoothed columns first)
-        for col in ['gradient_smoothed', 'bearing_smoothed', 'bearing_normalized']:
-            if col in self.df.columns:
-                self.df.drop(columns=[col], inplace=True)
-                
-        self.df["gradient_smoothed"] = self.smooth_data(self.df["gradient"], window_size=smoothing_window)
-        self.df["bearing_smoothed"] = self.smooth_data(self.df["bearing"], window_size=smoothing_window)
-
-        # Normalize bearing for clustering
-        self.df["bearing_normalized"] = normalize_bearing(self.df["bearing_smoothed"])
-        features = self.df[["gradient_smoothed", "bearing_normalized"]].to_numpy()
-
-        # Compute custom distance matrix
-        dist_matrix = squareform(pdist(features, metric=compute_custom_distance))
-
-        # Perform hierarchical clustering
-        clusterer = AgglomerativeClustering(
-            linkage="average",
-            n_clusters=None,
-            distance_threshold=None
+        self.df = self._cluster_course_types(
+            self.df,
+            max_clusters=max_clusters,
+            gradient_weight=gradient_weight,
+            bearing_weight=bearing_weight,
+            smoothing_window=smoothing_window,
+            min_segment_distance=min_segment_distance,
+            smoothing_distance=smoothing_distance,
+            gradient_clip=gradient_clip,
         )
-        clusterer.set_params(n_clusters=min(max_clusters, len(self.df)))
-        self.df["segment"] = clusterer.fit_predict(dist_matrix)
-        self.df['segment_terrain'] = 'cluster'
 
         # Aggregate segments
         self.aggregate_segments()
@@ -841,6 +1061,87 @@ class Course:
         return df
 
     # ========================================================================
+    # GRADIENT-BAND ("PACING ZONES") SEGMENTATION
+    # ========================================================================
+
+    def _assign_gradient_bands(self, df, flat_threshold, steep_threshold,
+                               smoothing_window, min_segment_distance):
+        """Label each point with a gradient-band id (shared by apply + preview).
+
+        Classifies the SMOOTHED gradient into a handful of recurring bands,
+        uses the band rank as the segment label (so the same band recurs along
+        the course → low optimizer dimensionality), then merges short runs so
+        the strategy stays rider-actionable. Mutates and returns `df`.
+        """
+        df = df.sort_values('cumulative_distance').reset_index(drop=True)
+        grad_smooth = df['gradient'].rolling(
+            window=smoothing_window, center=True, min_periods=1).mean()
+        band_names = grad_smooth.apply(
+            lambda g: classify_gradient_band(g, flat_threshold, steep_threshold))
+        df['segment'] = band_names.map(BAND_RANK).astype(int)
+
+        # Absorb tiny fragments into their longer neighbor (band id is reused
+        # so this never increases the number of distinct zones).
+        if min_segment_distance and min_segment_distance > 0:
+            df['segment'] = self._merge_short_runs(df, min_segment_distance)
+
+        # Re-derive band name per point from the (possibly merged) label so the
+        # name always agrees with the id used for coloring/labels.
+        rank_to_name = {v: k for k, v in BAND_RANK.items()}
+        df['segment_terrain'] = df['segment'].map(rank_to_name)
+        return df
+
+    def gradient_band_segmentation(self,
+                                   flat_threshold: float = 2.0,
+                                   steep_threshold: float = 6.0,
+                                   smoothing_window: int = 21,
+                                   min_segment_distance: float = 200.0):
+        """Segment the course into a few recurring gradient "pacing zones".
+
+        Each zone (Steep Descent / Descent / Flat / Climb / Steep Climb) shares
+        a single segment_id wherever it recurs, so the optimizer assigns ONE
+        power per zone — a simple, digestible pacing rule instead of a unique
+        target for every bump in the road.
+
+        Args:
+            flat_threshold: |gradient| (%) below which terrain is "flat".
+            steep_threshold: |gradient| (%) above which a climb/descent is "steep".
+            smoothing_window: Points for gradient smoothing before classifying.
+            min_segment_distance: Merge contiguous zones shorter than this (m).
+        """
+        # Clear any prior segmentation so labels don't accumulate.
+        for col in ('segment', 'segment_terrain'):
+            if col in self.df.columns:
+                self.df.drop(columns=[col], inplace=True)
+        for attr in ('course_segments', 'course_segments_aggregated'):
+            if hasattr(self, attr):
+                delattr(self, attr)
+
+        self.df = self._assign_gradient_bands(
+            self.df, flat_threshold, steep_threshold,
+            smoothing_window, min_segment_distance)
+
+        self.aggregate_segments()
+
+        # Carry the band name onto the aggregated segments for labels/colors.
+        if hasattr(self, 'course_segments') and not self.course_segments.empty:
+            name_map = self.df.groupby('segment')['segment_terrain'].first().to_dict()
+            seg_col = 'segment_id' if 'segment_id' in self.course_segments.columns else 'segment'
+            if seg_col in self.course_segments.columns:
+                self.course_segments['terrain'] = self.course_segments[seg_col].map(name_map)
+
+        n_zones = self.df['segment'].nunique()
+        print(f"Created {n_zones} pacing zones:")
+        for seg_id in sorted(self.df['segment'].unique()):
+            seg_data = self.df[self.df['segment'] == seg_id]
+            name = seg_data['segment_terrain'].iloc[0]
+            dist_km = seg_data['distance'].sum() / 1000
+            avg_grad = seg_data['gradient'].mean()
+            print(f"  {BAND_LABELS.get(name, name)}: {dist_km:.2f}km, {avg_grad:+.1f}%")
+
+        return self.df
+
+    # ========================================================================
     # PREVIEW SEGMENTATION METHODS (Non-destructive for interactive tuning)
     # ========================================================================
     
@@ -955,12 +1256,15 @@ class Course:
                                          max_clusters: int = 10,
                                          gradient_weight: float = 1.0,
                                          bearing_weight: float = 1.0,
-                                         smoothing_window: int = 5) -> pd.DataFrame:
+                                         smoothing_window: int = 5,
+                                         min_segment_distance: float = 200.0,
+                                         smoothing_distance=None,
+                                         gradient_clip: float = 12.0) -> pd.DataFrame:
         """
         Preview clustering-based segmentation without modifying self.df.
         
         Args:
-            max_clusters: Maximum number of clusters
+            max_clusters: Requested number of recurring terrain types
             gradient_weight: Weight for gradient feature
             bearing_weight: Weight for bearing feature
             smoothing_window: Window size for smoothing
@@ -968,46 +1272,26 @@ class Course:
         Returns:
             DataFrame with segment assignments
         """
-        df = self.df.copy()
-        
-        def normalize_bearing(bearing):
-            return np.radians(bearing)
-        
-        def compute_custom_distance(point_a, point_b):
-            grad_a, bear_a = point_a
-            grad_b, bear_b = point_b
-            grad_diff = abs(grad_a - grad_b)
-            bear_diff = abs(np.arctan2(np.sin(bear_a - bear_b), np.cos(bear_a - bear_b)))
-            
-            if abs(grad_a) > 2 or abs(grad_b) > 2:
-                grad_w = gradient_weight * 1.5
-                bear_w = bearing_weight * 0.5
-            else:
-                grad_w = gradient_weight * 0.5
-                bear_w = bearing_weight * 1.5
-            
-            return grad_w * grad_diff + bear_w * bear_diff
-        
-        # Smooth data
-        df["gradient_smoothed"] = df["gradient"].rolling(
-            window=smoothing_window, center=True, min_periods=1
-        ).mean()
-        df["bearing_smoothed"] = df["bearing"].rolling(
-            window=smoothing_window, center=True, min_periods=1
-        ).mean()
-        df["bearing_normalized"] = normalize_bearing(df["bearing_smoothed"])
-        
-        features = df[["gradient_smoothed", "bearing_normalized"]].to_numpy()
-        dist_matrix = squareform(pdist(features, metric=compute_custom_distance))
-        
-        clusterer = AgglomerativeClustering(
-            linkage="average",
-            n_clusters=min(max_clusters, len(df))
+        return self._cluster_course_types(
+            self.df,
+            max_clusters=max_clusters,
+            gradient_weight=gradient_weight,
+            bearing_weight=bearing_weight,
+            smoothing_window=smoothing_window,
+            min_segment_distance=min_segment_distance,
+            smoothing_distance=smoothing_distance,
+            gradient_clip=gradient_clip,
         )
-        df["segment"] = clusterer.fit_predict(dist_matrix)
-        df['segment_terrain'] = 'cluster'  # Placeholder
-        
-        return df
+
+    def preview_gradient_band_segmentation(self,
+                                           flat_threshold: float = 2.0,
+                                           steep_threshold: float = 6.0,
+                                           smoothing_window: int = 21,
+                                           min_segment_distance: float = 200.0) -> pd.DataFrame:
+        """Preview gradient-band ("pacing zones") segmentation non-destructively."""
+        return self._assign_gradient_bands(
+            self.df.copy(), flat_threshold, steep_threshold,
+            smoothing_window, min_segment_distance)
 
     # ========================================================================
     # PLOTLY VISUALIZATION METHODS
@@ -1051,15 +1335,29 @@ class Course:
             use_terrain_colors = True
         else:
             use_terrain_colors = False
-        
-        # Build color map
+
+        is_bands = method == 'bands' and 'segment_terrain' in df_sorted.columns
+
+        # Build color map + per-segment legend label
         segment_colors = {}
+        seg_legend = {}
         for i, seg_id in enumerate(unique_segments):
-            if use_terrain_colors:
+            if is_bands:
+                band = df_sorted[df_sorted['segment'] == seg_id]['segment_terrain'].iloc[0]
+                segment_colors[seg_id] = BAND_COLORS.get(band, SEGMENT_COLORSCALE[i % len(SEGMENT_COLORSCALE)])
+                seg_legend[seg_id] = BAND_LABELS.get(band, f'Zone {seg_id}')
+            elif method == 'clustering':
+                terrain = df_sorted[df_sorted['segment'] == seg_id]['segment_terrain'].iloc[0]
+                segment_colors[seg_id] = SEGMENT_COLORSCALE[i % len(SEGMENT_COLORSCALE)]
+                terrain_label = BAND_LABELS.get(terrain, terrain)
+                seg_legend[seg_id] = f'Type {int(seg_id) + 1} · {terrain_label}'
+            elif use_terrain_colors:
                 terrain = df_sorted[df_sorted['segment'] == seg_id]['segment_terrain'].iloc[0]
                 segment_colors[seg_id] = TERRAIN_COLORS.get(terrain, SEGMENT_COLORSCALE[i % len(SEGMENT_COLORSCALE)])
+                seg_legend[seg_id] = f'Cluster {seg_id}'
             else:
                 segment_colors[seg_id] = SEGMENT_COLORSCALE[i % len(SEGMENT_COLORSCALE)]
+                seg_legend[seg_id] = f'Cluster {seg_id}'
         
         # Create subplots
         if show_segment_bar:
@@ -1077,8 +1375,8 @@ class Course:
         
         # For clustering, we need to plot each CONTIGUOUS RUN separately
         # since the same segment ID can appear at multiple positions
-        if method == 'clustering':
-            # For clustering, we'll only show legend entries for unique segment types (clusters)
+        if method in ('clustering', 'bands'):
+            # Show legend entries once per unique segment type (cluster/zone),
             # not for every contiguous run
             legend_added = set()
             
@@ -1109,8 +1407,8 @@ class Course:
                         if show_legend:
                             legend_added.add(prev_seg)
                         
-                        # Simplified legend name for clustering - just show "Cluster X"
-                        legend_name = f'Cluster {prev_seg}'
+                        # Legend label: human zone name for bands, else "Cluster X"
+                        legend_name = seg_legend.get(prev_seg, f'Cluster {prev_seg}')
                         
                         fig.add_trace(
                             go.Scatter(
@@ -1124,7 +1422,7 @@ class Course:
                                 legendgroup=f'cluster_{prev_seg}',
                                 showlegend=show_legend,
                                 hovertemplate=(
-                                    f'<b>Cluster {prev_seg}</b><br>'
+                                    f'<b>{legend_name}</b><br>'
                                     f'Distance: %{{x:.2f}} km<br>'
                                     f'Altitude: %{{y:.0f}} m<br>'
                                     f'Avg Gradient: {avg_grad:+.1f}%<extra></extra>'
@@ -1152,7 +1450,7 @@ class Course:
                 if show_legend:
                     legend_added.add(prev_seg)
                 
-                legend_name = f'Cluster {prev_seg}'
+                legend_name = seg_legend.get(prev_seg, f'Cluster {prev_seg}')
                 
                 fig.add_trace(
                     go.Scatter(
@@ -1166,7 +1464,7 @@ class Course:
                         legendgroup=f'cluster_{prev_seg}',
                         showlegend=show_legend,
                         hovertemplate=(
-                            f'<b>Cluster {prev_seg}</b><br>'
+                            f'<b>{legend_name}</b><br>'
                             f'Distance: %{{x:.2f}} km<br>'
                             f'Altitude: %{{y:.0f}} m<br>'
                             f'Avg Gradient: {avg_grad:+.1f}%<extra></extra>'
@@ -1246,8 +1544,8 @@ class Course:
         
         # Add segment bar if requested
         if show_segment_bar:
-            if method == 'clustering':
-                # For clustering, show each contiguous run as a separate bar
+            if method in ('clustering', 'bands'):
+                # For clustering/bands, show each contiguous run as a separate bar
                 prev_seg = None
                 run_start_idx = 0
                 
@@ -1263,6 +1561,7 @@ class Course:
                             
                             run_mask = (df_sorted.index >= run_start_idx) & (df_sorted.index < i)
                             avg_grad = df_sorted.loc[run_mask, 'gradient'].mean()
+                            display_id = int(prev_seg) + 1 if method == 'clustering' else prev_seg
                             
                             fig.add_trace(
                                 go.Bar(
@@ -1273,10 +1572,10 @@ class Course:
                                     opacity=0.8,
                                     showlegend=False,
                                     hovertemplate=(
-                                        f'<b>Seg {prev_seg}</b><br>'
+                                        f'<b>Type {display_id}</b><br>'
                                         f'{avg_grad:+.1f}%<extra></extra>'
                                     ),
-                                    text=str(prev_seg),
+                                    text=str(display_id),
                                     textposition='inside',
                                     textfont=dict(size=8, color='white')
                                 ),
@@ -1293,6 +1592,7 @@ class Course:
                     
                     run_mask = df_sorted.index >= run_start_idx
                     avg_grad = df_sorted.loc[run_mask, 'gradient'].mean()
+                    display_id = int(prev_seg) + 1 if method == 'clustering' else prev_seg
                     
                     fig.add_trace(
                         go.Bar(
@@ -1303,10 +1603,10 @@ class Course:
                             opacity=0.8,
                             showlegend=False,
                             hovertemplate=(
-                                f'<b>Seg {prev_seg}</b><br>'
+                                f'<b>Type {display_id}</b><br>'
                                 f'{avg_grad:+.1f}%<extra></extra>'
                             ),
-                            text=str(prev_seg),
+                            text=str(display_id),
                             textposition='inside',
                             textfont=dict(size=8, color='white')
                         ),
@@ -1401,9 +1701,12 @@ class Course:
             use_terrain_colors = True
         else:
             use_terrain_colors = False
-        
-        # For clustering method, segments are non-contiguous so we use markers only
-        # For terrain/equal, segments are contiguous so we can use lines
+
+        is_bands = method == 'bands' and 'segment_terrain' in df_sorted.columns
+
+        # For clustering, segments are non-contiguous so we use markers only.
+        # For terrain/equal/bands, each band/segment is drawn as its contiguous
+        # runs (lines), so the same zone can recur along the route.
         use_lines = method != 'clustering'
         
         fig = go.Figure()
@@ -1430,7 +1733,11 @@ class Course:
                 continue
             
             # Determine color
-            if use_terrain_colors:
+            if is_bands:
+                band = seg_data['segment_terrain'].iloc[0]
+                color = BAND_COLORS.get(band, SEGMENT_COLORSCALE[i % len(SEGMENT_COLORSCALE)])
+                legend_name = BAND_LABELS.get(band, f'Zone {seg_id}')
+            elif use_terrain_colors:
                 terrain = seg_data['segment_terrain'].iloc[0]
                 color = TERRAIN_COLORS.get(terrain, SEGMENT_COLORSCALE[i % len(SEGMENT_COLORSCALE)])
                 legend_name = f'Seg {seg_id} ({terrain})'

@@ -4,7 +4,7 @@ import traceback
 from app.strava_calls import get_activities, get_power_stream
 
 
-def calculate_critical_power(activities, durations):
+def calculate_critical_power(activities, durations, user_id=None):
     """
     Calculate the best critical power for specified durations.
 
@@ -22,7 +22,7 @@ def calculate_critical_power(activities, durations):
 
         try:
             # Attempt to get the power stream
-            power_stream = get_power_stream(activity_id)
+            power_stream = get_power_stream(activity_id, user_id=user_id)
         except Exception as e:
             print(f"Error processing activity {activity_id}: {e}")
             continue

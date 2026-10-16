@@ -227,6 +227,20 @@ class TestGetActivities:
         assert result[0]["id"] == 12345678
         assert result[0]["name"] == "Morning Ride"
         mock_get.assert_called_once()
+
+    @patch('app.strava_calls.get_access_token')
+    @patch('app.strava_calls.requests.get')
+    def test_get_activities_uses_requested_user(
+            self, mock_get, mock_token, mock_activities_response):
+        mock_token.return_value = "user_token"
+        mock_response = MagicMock()
+        mock_response.status_code = 200
+        mock_response.json.return_value = mock_activities_response
+        mock_get.return_value = mock_response
+
+        get_activities(days=30, user_id='user-42')
+
+        mock_token.assert_called_once_with('user-42')
     
     @patch('app.strava_calls.get_access_token')
     @patch('app.strava_calls.requests.get')

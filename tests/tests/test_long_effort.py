@@ -200,12 +200,19 @@ class TestLongEffortVariablePacing:
             f"W' went below zero: {results_df['w_remaining'].min():.0f}")
 
     def test_average_power_below_cp(self, optimizer, long_cluster_course):
-        """Average power for a long course should be below CP."""
+        """Distance-weighted average power for a long course should be near/below CP.
+
+        Uses a distance-weighted mean (not a naive per-segment mean, which would
+        over-weight short, repeated climb segments) since that is the
+        physiologically meaningful average a rider sustains over the course.
+        """
         results_df, _, _ = optimizer.optimize_variable_pacing(
             long_cluster_course, target_w_utilization=0.70)
-        avg_power = results_df['target_power'].mean()
+        avg_power = np.average(
+            results_df['target_power'], weights=results_df['distance'])
         assert avg_power < CP * 1.02, (
-            f"Average power {avg_power:.0f}W should be near/below CP for long effort")
+            f"Distance-weighted average power {avg_power:.0f}W should be "
+            "near/below CP for long effort")
 
     def test_climb_clusters_get_more_power(self, optimizer, long_cluster_course):
         """Climb clusters (segment_id=2) should get more power than flat (1) or descent (3)."""

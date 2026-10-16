@@ -24,7 +24,7 @@ def _parse_stream_response(response_json, stream_type):
     return []
 
 
-def fetch_segment_data(segment_id):
+def fetch_segment_data(segment_id, user_id=None):
     """
     Fetch latitude, longitude, and altitude data for a specific segment from Strava API.
 
@@ -35,7 +35,7 @@ def fetch_segment_data(segment_id):
         dict: A dictionary with 'latlng' and 'altitude' keys containing data arrays,
               or None if request fails.
     """
-    access_token = get_access_token()
+    access_token = get_access_token(user_id)
     url = f"https://www.strava.com/api/v3/segments/{segment_id}/streams"
     headers = {"Authorization": f"Bearer {access_token}"}
     params = {
@@ -57,7 +57,7 @@ def fetch_segment_data(segment_id):
         return None
 
 
-def get_activities(days, per_page=100):
+def get_activities(days, per_page=100, user_id=None):
     """
     Fetch activities from Strava API for the specified number of days.
     
@@ -75,7 +75,7 @@ def get_activities(days, per_page=100):
         Requires `activity:read` scope. Only Me activities will be filtered out
         unless token has `activity:read_all` scope.
     """
-    access_token = get_access_token()
+    access_token = get_access_token(user_id)
     end_date = datetime.datetime.now()
     start_date = end_date - datetime.timedelta(days=days)
     
@@ -128,7 +128,7 @@ def get_activities(days, per_page=100):
     return all_activities
 
 
-def get_power_stream(activity_id):
+def get_power_stream(activity_id, user_id=None):
     """
     Retrieve the power stream for a specific activity.
     
@@ -145,7 +145,7 @@ def get_power_stream(activity_id):
         Requires `activity:read` scope. Requires `activity:read_all` for Only Me activities.
     """
     url = f"https://www.strava.com/api/v3/activities/{activity_id}/streams"
-    headers = {"Authorization": f"Bearer {get_access_token()}"}
+    headers = {"Authorization": f"Bearer {get_access_token(user_id)}"}
     params = {
         "keys": "watts",
         "key_by_type": "true"  # Returns dict format: {"watts": {"data": [...]}}
@@ -169,7 +169,27 @@ def get_power_stream(activity_id):
         raise Exception(error_msg)
     
     
-def get_athlete_id():
+def get_athlete_profile(user_id=None):
+    """Return the authenticated Strava athlete profile."""
+    access_token = get_access_token(user_id)
+    url = "https://www.strava.com/api/v3/athlete"
+    headers = {"Authorization": f"Bearer {access_token}"}
+    response = requests.get(url, headers=headers)
+
+    if response.status_code == 200:
+        return response.json()
+
+    error_msg = f"Failed to fetch athlete data: {response.status_code}"
+    try:
+        error_detail = response.json()
+        if "message" in error_detail:
+            error_msg += f" - {error_detail['message']}"
+    except Exception:
+        error_msg += f" - {response.text}"
+    raise Exception(error_msg)
+
+
+def get_athlete_id(user_id=None):
     """
     Retrieve the authenticated athlete's ID from the Strava API.
     
@@ -180,27 +200,14 @@ def get_athlete_id():
         Uses GET /athlete endpoint. Tokens with `profile:read_all` scope will receive
         a detailed athlete representation; all others receive a summary representation.
     """
-    access_token = get_access_token()
-    url = "https://www.strava.com/api/v3/athlete"
-    headers = {"Authorization": f"Bearer {access_token}"}
-    response = requests.get(url, headers=headers)
-
-    if response.status_code == 200:
-        athlete_data = response.json()
-        return athlete_data.get("id")
-    else:
-        error_msg = f"Failed to fetch athlete data: {response.status_code}"
-        try:
-            error_detail = response.json()
-            if "message" in error_detail:
-                error_msg += f" - {error_detail['message']}"
-        except:
-            error_msg += f" - {response.text}"
-        print(error_msg)
+    try:
+        return get_athlete_profile(user_id=user_id).get("id")
+    except Exception as error:
+        print(error)
         return None
 
 
-def fetch_segment_details(segment_id):
+def fetch_segment_details(segment_id, user_id=None):
     """
     Fetch segment details including name, distance, elevation, etc. from Strava API.
 
@@ -215,7 +222,7 @@ def fetch_segment_details(segment_id):
     Note:
         Requires `read_all` scope to retrieve athlete-specific segment info or private segments.
     """
-    access_token = get_access_token()
+    access_token = get_access_token(user_id)
     url = f"https://www.strava.com/api/v3/segments/{segment_id}"
     headers = {"Authorization": f"Bearer {access_token}"}
 
@@ -235,7 +242,7 @@ def fetch_segment_details(segment_id):
         return None
 
 
-def get_activity_by_id(activity_id, include_all_efforts=False):
+def get_activity_by_id(activity_id, include_all_efforts=False, user_id=None):
     """
     Fetch a single activity by ID with full details.
     
@@ -251,7 +258,7 @@ def get_activity_by_id(activity_id, include_all_efforts=False):
         Requires `activity:read` for Everyone and Followers activities.
         Requires `activity:read_all` for Only Me activities.
     """
-    access_token = get_access_token()
+    access_token = get_access_token(user_id)
     url = f"https://www.strava.com/api/v3/activities/{activity_id}"
     headers = {"Authorization": f"Bearer {access_token}"}
     params = {"include_all_efforts": str(include_all_efforts).lower()}

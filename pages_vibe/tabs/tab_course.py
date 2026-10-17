@@ -41,9 +41,6 @@ def render(db: CourseDatabase) -> None:
 
     st.divider()
     _render_course_overview(course)
-    if st.button("Continue to Segment", type="primary", width="stretch"):
-        _workflow.set_active_step('segment')
-        st.rerun()
 
 
 # ── Database loader ─────────────────────────────────────────────────────────
@@ -106,7 +103,7 @@ def _load_course_from_db(db: CourseDatabase, course_id: str, label: str) -> None
             st.error("No GPS data available for this course.")
             return
 
-        _workflow.mark_course_loaded(
+        _commit_course_and_advance(
             course=course,
             course_id=course_id,
             course_name=cdata.get('course_name', label),
@@ -145,7 +142,7 @@ def _render_csv_upload() -> None:
             with st.spinner("Processing CSV…"):
                 df = pd.read_csv(uploaded)
                 course = Course(df)
-                _workflow.mark_course_loaded(
+                _commit_course_and_advance(
                     course=course, course_id=None, course_name=csv_name)
             st.toast(f"Loaded: {csv_name}")
             st.rerun()
@@ -213,7 +210,7 @@ def _render_strava_fetch() -> None:
             course = Course(df_raw)
             course_id = _persist_strava_segment(seg_id_input, seg_name, raw_gps)
 
-            _workflow.mark_course_loaded(
+            _commit_course_and_advance(
                 course=course, course_id=course_id, course_name=seg_name)
             st.session_state['_last_strava_seg_id'] = str(seg_id_input).strip()
 
@@ -223,6 +220,18 @@ def _render_strava_fetch() -> None:
         st.error(f"Strava fetch failed: {e}")
         st.info("Check your STRAVA_CLIENT_ID, STRAVA_CLIENT_SECRET, "
                 "and tokens in `.env`.")
+
+
+def _commit_course_and_advance(course: Course, course_id: str | None,
+                               course_name: str) -> None:
+    """Commit a successfully loaded course and open segmentation."""
+    _workflow.mark_course_loaded(
+        course=course,
+        course_id=course_id,
+        course_name=course_name,
+    )
+    if not _workflow.set_active_step('segment'):
+        raise RuntimeError("Loaded course did not unlock segmentation.")
 
 
 def _persist_strava_segment(seg_id: str, seg_name: str, raw_gps: list) -> str:

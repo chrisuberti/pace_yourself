@@ -37,7 +37,7 @@ BAND_RANK = {
 BAND_LABELS = {
     'steep_descent': 'Steep Descent',
     'descent': 'Descent',
-    'flat': 'Flat / Rolling',
+    'flat': 'Flat',
     'climb': 'Climb',
     'steep_climb': 'Steep Climb',
 }

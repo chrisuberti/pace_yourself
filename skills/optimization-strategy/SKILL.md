@@ -22,7 +22,11 @@ Scope: why `app/optimization.py` is shaped the way it is. For diagnosis, use [op
 ## Variable pacing
 - Cluster-aware when `segment_id` exists; equal segmentation falls back to per-segment strategy.
 - Heuristic seed: compute cluster gradients, split effort vs recovery, enforce enough recovery distance, scale W' by terrain variation, then distribute effort power and clamp recovery power below CP.
-- Refinement: optimize cluster powers for minimum time with finite penalties and multi-start seeds.
+- Refinement: differential evolution supplies a global seed for 2–5 pacing
+  zones, then constrained SLSQP minimizes time across all cluster powers.
+- Constraints keep W' positive with a small aggregate-to-granular reserve,
+  preserve the finish budget, and require power to be nondecreasing with
+  average gradient so the pacing rule remains rider-actionable.
 - Safety rule: variable pacing should not end slower than the uniform-baseline fallback.
 
 ## Important constants and thresholds
@@ -61,8 +65,10 @@ Enforced by `_expand_cluster_powers(cluster_power_map, segment_ids)` in
 
 ### 2. Variable pacing = min-time subject to W' budget ceiling
 Objective: minimise total course time. Constraints:
-- W' never goes below 0 mid-course (feasibility).
+- Aggregate W' retains a 2% reserve mid-course so point-level simulation does
+  not cross below 0 because of segment averaging.
 - Final W' >= (1 - W_PRIME_BUDGET_CEILING) * W'  (budget ceiling, not exact target).
+- Target power is nondecreasing with cluster-average gradient.
 `W_PRIME_BUDGET_CEILING = 0.90` is a module constant in `app/optimization.py`.
 It is NOT a UI slider. Applied to BOTH constant and variable strategies.
 

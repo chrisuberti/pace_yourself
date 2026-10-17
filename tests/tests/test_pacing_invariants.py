@@ -55,8 +55,8 @@ def _segments(distances, gradients, segment_ids):
 
 
 @pytest.fixture
-def rolling_course():
-    """Rolling terrain: flat / climb / descent alternating with W' headroom.
+def variable_terrain_course():
+    """Mixed terrain: flat / climb / descent alternating with W' headroom.
 
     Variation SHOULD help here — push on climbs (slow, time-dense), ease on
     descents (where power barely affects speed), bank W' on the flats.
@@ -119,7 +119,7 @@ class TestGradientSmoothing:
             f"{pinned*100:.1f}% of points pinned at clamp — smoothing too weak"
 
 
-# ── 2. Variation helps on rolling terrain ──────────────────────────────────
+# ── 2. Variation helps on mixed terrain ────────────────────────────────────
 
 class TestVariationWhenItHelps:
     @pytest.fixture
@@ -127,21 +127,28 @@ class TestVariationWhenItHelps:
         # Generous W' so the rider has headroom to redistribute effort.
         return CourseOptimizer(critical_power=280, w_prime=28000)
 
-    def test_variable_beats_constant_on_rolling(self, optimizer, rolling_course):
-        const_p, const_t, _ = optimizer.optimize_constant_power(rolling_course)
-        _, var_t, _ = optimizer.optimize_variable_pacing(rolling_course)
+    def test_variable_beats_constant_on_mixed_terrain(
+            self, optimizer, variable_terrain_course):
+        const_p, const_t, _ = optimizer.optimize_constant_power(
+            variable_terrain_course)
+        _, var_t, _ = optimizer.optimize_variable_pacing(
+            variable_terrain_course)
         assert var_t <= const_t + 1e-6, \
             f"Variable ({var_t:.1f}s) must not be slower than constant ({const_t:.1f}s)"
 
-    def test_visible_power_spread_on_rolling(self, optimizer, rolling_course):
-        results_df, _, _ = optimizer.optimize_variable_pacing(rolling_course)
+    def test_visible_power_spread_on_mixed_terrain(
+            self, optimizer, variable_terrain_course):
+        results_df, _, _ = optimizer.optimize_variable_pacing(
+            variable_terrain_course)
         cluster_powers = results_df.groupby('segment_id')['target_power'].first()
         spread = cluster_powers.max() - cluster_powers.min()
         assert spread >= 10.0, \
             f"Expected visible per-cluster spread, got {spread:.1f}W ({dict(cluster_powers.round())})"
 
-    def test_climb_gets_more_than_descent(self, optimizer, rolling_course):
-        results_df, _, _ = optimizer.optimize_variable_pacing(rolling_course)
+    def test_climb_gets_more_than_descent(
+            self, optimizer, variable_terrain_course):
+        results_df, _, _ = optimizer.optimize_variable_pacing(
+            variable_terrain_course)
         climb = results_df.loc[results_df['segment_id'] == 2, 'target_power'].iloc[0]
         descent = results_df.loc[results_df['segment_id'] == 3, 'target_power'].iloc[0]
         assert climb > descent, f"Climb {climb:.0f}W should exceed descent {descent:.0f}W"
@@ -172,9 +179,11 @@ class TestOnePowerPerCluster:
     def optimizer(self):
         return CourseOptimizer(critical_power=280, w_prime=28000)
 
-    def test_uniform_power_within_each_cluster(self, optimizer, rolling_course):
-        results_df, _, _ = optimizer.optimize_variable_pacing(rolling_course)
-        for sid in rolling_course['segment_id'].unique():
+    def test_uniform_power_within_each_cluster(
+            self, optimizer, variable_terrain_course):
+        results_df, _, _ = optimizer.optimize_variable_pacing(
+            variable_terrain_course)
+        for sid in variable_terrain_course['segment_id'].unique():
             powers = results_df.loc[results_df['segment_id'] == sid, 'target_power']
             assert powers.round(2).nunique() == 1, \
                 f"Cluster {sid} has non-uniform power: {powers.values}"
@@ -187,9 +196,10 @@ class TestBruteForceAgreement:
     def optimizer(self):
         return CourseOptimizer(critical_power=280, w_prime=28000)
 
-    def test_within_tolerance_of_grid_optimum(self, optimizer, rolling_course):
+    def test_within_tolerance_of_grid_optimum(
+            self, optimizer, variable_terrain_course):
         """Heuristic+refinement should be within ~1% of an exhaustive grid search."""
-        norm = optimizer._normalize_segments(rolling_course)
+        norm = optimizer._normalize_segments(variable_terrain_course)
         clusters = sorted(norm['segment_id'].unique())
 
         best_time = np.inf
@@ -202,12 +212,13 @@ class TestBruteForceAgreement:
             if sim['feasible'] and sim['total_time'] < best_time:
                 best_time = sim['total_time']
 
-        _, var_t, _ = optimizer.optimize_variable_pacing(rolling_course)
+        _, var_t, _ = optimizer.optimize_variable_pacing(
+            variable_terrain_course)
         assert var_t <= best_time * 1.01, \
             f"Optimizer time {var_t:.1f}s exceeds grid optimum {best_time:.1f}s by >1%"
 
 
-# ── 6. Real rolling course regression: 'Pedal till ya puke' ────────────────
+# ── 6. Real mixed-terrain regression: 'Pedal till ya puke' ────────────────
 #
 # Mauna Kea is a poor optimizer test: it is a monotonic uphill where constant
 # power is provably optimal, so it can NEVER exercise variable pacing. The
@@ -273,6 +284,45 @@ class TestPedalTillYaPukeRealCourse:
             powers = var_df.loc[var_df['segment_id'] == sid, 'target_power']
             assert powers.round(2).nunique() == 1, \
                 f"Cluster {sid} has non-uniform power: {powers.values}"
+
+    def test_high_cp_low_w_prime_terrain_finds_granular_gain(self):
+        """Reported 352 W / 16 kJ rider must not collapse to constant power."""
+        course = Course(pd.read_csv(PTYP_FIXTURE))
+        course.gradient_band_segmentation(
+            flat_threshold=2.0,
+            steep_threshold=6.0,
+            min_segment_distance=200,
+        )
+        course.enable_enhanced_segmentation()
+        opt_segs = create_course_segments_from_course(course)
+        opt = CourseOptimizer(
+            critical_power=352,
+            w_prime=16000,
+            mass=93.5,
+            cda=0.356,
+            crr=0.004,
+        )
+        const_p, _, const_df = opt.optimize_constant_power(
+            opt_segs, target_w_utilization=W_PRIME_BUDGET_CEILING)
+        var_df, _, _ = opt.optimize_variable_pacing(
+            opt_segs,
+            target_w_utilization=W_PRIME_BUDGET_CEILING,
+            baseline_power=const_p,
+        )
+
+        powers = var_df.groupby('segment_id')['target_power'].first()
+        gradients = var_df.groupby('segment_id')['gradient'].mean()
+        gradient_order = gradients.sort_values().index
+        assert np.diff(powers.loc[gradient_order]).min() >= -1e-3
+        assert powers.max() - powers.min() >= 100.0
+
+        _, const_time, _ = opt.simulate_course_detailed(
+            course, const_df, const_p, target_resolution=1000)
+        power_map = powers.to_dict()
+        detailed, var_time, _ = opt.simulate_course_detailed(
+            course, var_df, power_map, target_resolution=1000)
+        assert const_time - var_time >= 15.0
+        assert detailed['w_remaining'].min() >= 0.0
 
 
 # ── 7. Terrain (many-segment) must vary, not collapse to constant ──────────

@@ -43,6 +43,10 @@ single runtime path.
 - Optimization supports both constant power and variable pacing paths.
 - `CourseOptimizer` owns the canonical speed and W' transition kernels used by
 	segment optimization and granular result simulation.
+- Variable pacing uses a deterministic global-to-local search: differential
+  evolution seeds low-dimensional terrain zones and constrained SLSQP refines
+  all cluster powers. W' feasibility, a granular-simulation reserve, and
+  nondecreasing power by average gradient are explicit constraints.
 - The canonical UI passes total system mass (rider plus bike), CdA, and Crr into
 	`CourseOptimizer`; legacy callers retain documented constructor defaults.
 - Segment and granular simulations may differ in resolution, but must use the

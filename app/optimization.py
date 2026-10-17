@@ -7,7 +7,7 @@ Integrated from notebooks/StartCourseEstimation.ipynb as part of Phase 1 consoli
 
 import pandas as pd
 import numpy as np
-from scipy.optimize import minimize
+from scipy.optimize import differential_evolution, minimize
 from typing import Tuple, Dict, Any, Optional
 import itertools
 import os
@@ -983,12 +983,212 @@ class CourseOptimizer:
             course_segments, initial_strategy, target_w_utilization)
 
     # ------------------------------------------------------------------ #
-    #  Cluster-aware refinement (NEW — scipy minimizer)                    #
+    #  Cluster-aware global-to-local constrained refinement                 #
     # ------------------------------------------------------------------ #
     def _refine_cluster_strategy(self, course_segments: pd.DataFrame,
                                  initial_strategy: np.ndarray,
                                  target_w_utilization: float,
                                  baseline_power: float = None) -> np.ndarray:
+        """Optimize cluster powers with global and constrained local search.
+
+        Differential evolution finds coordinated redistributions for courses
+        with a few pacing zones. SLSQP then minimizes time while explicitly
+        enforcing non-negative W' throughout the course and the finish budget.
+        """
+        segment_ids = course_segments['segment_id']
+        unique_ids = sorted(segment_ids.unique())
+        n_clusters = len(unique_ids)
+        id_to_idx = {cid: i for i, cid in enumerate(unique_ids)}
+
+        if baseline_power is None:
+            baseline_power = self.critical_power
+
+        initial_map = _cluster_power_map_from_array(
+            initial_strategy, segment_ids)
+        x0 = np.array([initial_map[cid] for cid in unique_ids])
+
+        est_duration = self._estimate_course_duration(course_segments)
+        is_long = est_duration > 3600
+        if is_long:
+            base_power = self.max_sustainable_power_for_duration(est_duration)
+            max_power = self.critical_power * 1.4
+            min_power = base_power * 0.70
+        else:
+            max_power = self.critical_power * 1.8
+            min_power = self.critical_power * 0.55
+        bounds = [(min_power, max_power)] * n_clusters
+        cluster_grads = np.array([
+            float(course_segments.loc[
+                segment_ids == cid, 'gradient'
+            ].mean())
+            for cid in unique_ids
+        ])
+        gradient_order = np.argsort(cluster_grads)
+
+        floor_w = self.w_prime * (1.0 - target_w_utilization)
+        constraint_margin = max(1.0, self.w_prime * 0.02)
+        baseline_strategy = np.full(len(course_segments), baseline_power)
+        best_result = {'time': 1e6, 'strategy': baseline_strategy}
+
+        def simulate_cluster_powers(x):
+            cmap = {cid: x[id_to_idx[cid]] for cid in unique_ids}
+            power_array = _expand_cluster_powers(cmap, segment_ids)
+            sim = self._simulate_variable_pacing(
+                course_segments, power_array)
+            return power_array, sim
+
+        def w_path(sim):
+            return np.array([
+                result['w_remaining']
+                for result in sim['segment_results']
+            ])
+
+        def is_feasible(x, sim):
+            monotonic_by_gradient = (
+                n_clusters < 2
+                or np.all(np.diff(x[gradient_order]) >= -1e-6)
+            )
+            return (
+                np.all(w_path(sim) >= constraint_margin - 1e-6)
+                and sim['final_w_remaining']
+                >= floor_w - 1e-6
+                and monotonic_by_gradient
+            )
+
+        def record_if_best(x):
+            power_array, sim = simulate_cluster_powers(x)
+            if is_feasible(x, sim) and sim['total_time'] < best_result['time']:
+                best_result['time'] = sim['total_time']
+                best_result['strategy'] = power_array.copy()
+            return sim
+
+        def objective(x):
+            return record_if_best(x)['total_time']
+
+        def constraint_values(x):
+            _, sim = simulate_cluster_powers(x)
+            constraints = [
+                w_path(sim) - constraint_margin,
+                np.array([
+                    sim['final_w_remaining']
+                    - floor_w
+                ]),
+            ]
+            if n_clusters >= 2:
+                constraints.append(np.diff(x[gradient_order]))
+            return np.concatenate(constraints)
+
+        def global_objective(x):
+            _, sim = simulate_cluster_powers(x)
+            mid_course_deficit = max(
+                0.0, constraint_margin - w_path(sim).min())
+            finish_deficit = max(
+                0.0,
+                floor_w - sim['final_w_remaining'],
+            )
+            return (
+                sim['total_time']
+                + 20.0 * mid_course_deficit
+                + 2.0 * finish_deficit
+            )
+
+        rng = np.random.default_rng(42)
+        starts = [
+            x0,
+            np.full(n_clusters, baseline_power),
+            np.full(n_clusters, max(min_power, baseline_power * 0.95)),
+        ]
+
+        if n_clusters >= 2:
+            mean_x0 = np.mean(x0)
+            starts.append(np.clip(
+                mean_x0 + (x0 - mean_x0) * 1.5,
+                min_power,
+                max_power,
+            ))
+            for _ in range(2):
+                starts.append(np.clip(
+                    x0 + rng.normal(
+                        0, self.critical_power * 0.05, n_clusters),
+                    min_power,
+                    max_power,
+                ))
+
+            push = np.where(
+                cluster_grads > 0.0, max_power, baseline_power)
+            starts.append(np.clip(push, min_power, max_power))
+
+            dists = np.array([
+                float(course_segments.loc[
+                    segment_ids == cid, 'distance'
+                ].sum())
+                for cid in unique_ids
+            ])
+            weights = (
+                dists / dists.sum()
+                if dists.sum() > 0
+                else np.ones(n_clusters) / n_clusters
+            )
+            tilt = cluster_grads - np.average(
+                cluster_grads, weights=weights)
+            tilt_scale = np.abs(tilt).max()
+            if tilt_scale > 1e-9:
+                tilt /= tilt_scale
+                power_span = max_power - baseline_power
+                for alpha in np.linspace(
+                        power_span * 0.1, power_span, 5):
+                    starts.append(np.clip(
+                        baseline_power + alpha * tilt,
+                        min_power,
+                        max_power,
+                    ))
+
+        if 2 <= n_clusters <= 5:
+            global_result = differential_evolution(
+                global_objective,
+                bounds,
+                seed=42,
+                popsize=8,
+                maxiter=40,
+                tol=0.002,
+                polish=False,
+                workers=1,
+                updating='immediate',
+            )
+            starts.append(global_result.x)
+
+        for start in starts:
+            try:
+                result = minimize(
+                    objective,
+                    start,
+                    method='SLSQP',
+                    bounds=bounds,
+                    constraints={
+                        'type': 'ineq',
+                        'fun': constraint_values,
+                    },
+                    options={'maxiter': 250, 'ftol': 1e-7},
+                )
+                record_if_best(result.x)
+            except (ValueError, FloatingPointError, OverflowError) as exc:
+                print(f"Warning: cluster refinement seed failed: {exc}")
+
+        final_map = _cluster_power_map_from_array(
+            best_result['strategy'], segment_ids)
+        sim = self._simulate_variable_pacing(
+            course_segments, best_result['strategy'])
+        print(f"Cluster refinement → {sim['total_time']/60:.1f} min, "
+              f"W' util: {sim['w_utilization']*100:.1f}%")
+        for cid in unique_ids:
+            print(f"  Cluster {cid}: {final_map[cid]:.0f} W")
+
+        return best_result['strategy']
+
+    def _refine_cluster_strategy_legacy(self, course_segments: pd.DataFrame,
+                                        initial_strategy: np.ndarray,
+                                        target_w_utilization: float,
+                                        baseline_power: float = None) -> np.ndarray:
         """Optimise N_cluster power values to minimise total course time.
 
         Objective: minimise time subject to:

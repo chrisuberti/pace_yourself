@@ -7,7 +7,12 @@ from unittest.mock import Mock
 import pandas as pd
 import pytest
 
-from pages_vibe.tabs import _workflow, tab_optimization
+from pages_vibe.tabs import (
+    _workflow,
+    tab_course,
+    tab_optimization,
+    tab_segmentation,
+)
 from pages_vibe.tabs.state import RIDER_DEFAULTS, SESSION_DEFAULTS
 
 
@@ -61,6 +66,45 @@ def test_navigation_changes_only_active_step(workflow_state):
     assert workflow_state['vibe_optimization_results'] is results
     assert workflow_state['vibe_results_course_df'].empty
     assert not _workflow.results_are_stale()
+
+
+def test_successful_course_confirmation_advances_to_segmentation(
+    workflow_state,
+):
+    course = _course()
+
+    tab_course._commit_course_and_advance(
+        course, 'course-1', 'Test Course')
+
+    assert workflow_state['vibe_course'] is course
+    assert workflow_state['vibe_active_step'] == 'segment'
+
+
+def test_successful_segmentation_advances_to_rider(
+    workflow_state,
+    monkeypatch,
+):
+    course = _course()
+    course.gradient_band_segmentation = Mock()
+    course.enable_enhanced_segmentation = Mock()
+    _workflow.mark_course_loaded(course, 'course-1', 'Test Course')
+    monkeypatch.setattr(
+        tab_segmentation.st, 'spinner', lambda _label: nullcontext())
+    monkeypatch.setattr(tab_segmentation.st, 'toast', Mock())
+    monkeypatch.setattr(tab_segmentation.st, 'rerun', Mock())
+
+    tab_segmentation._apply_segmentation(
+        course,
+        'Terrain',
+        {
+            'flat_threshold': 2.0,
+            'steep_threshold': 6.0,
+            'min_segment_distance': 200,
+        },
+    )
+
+    assert workflow_state['vibe_segmentation_applied']
+    assert workflow_state['vibe_active_step'] == 'rider'
 
 
 def test_committed_course_change_retains_and_stales_result(workflow_state):

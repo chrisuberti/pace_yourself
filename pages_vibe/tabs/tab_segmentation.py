@@ -67,11 +67,6 @@ def render() -> None:
                 except Exception as e:
                     st.warning(f"Map unavailable: {e}")
 
-        if st.button("Continue to Rider", type="primary", width="stretch"):
-            _workflow.set_active_step('rider')
-            st.rerun()
-
-
 # ── Controls ────────────────────────────────────────────────────────────────
 
 def _segmentation_controls(seg_method: str) -> tuple[dict, str]:
@@ -82,7 +77,7 @@ def _segmentation_controls(seg_method: str) -> tuple[dict, str]:
         return dict(
             flat_threshold=st.slider(
                 "Flat band (±%)", 0.5, 4.0, 2.0, 0.5,
-                help="|gradient| below this is Flat/Rolling"),
+                help="|gradient| below this is Flat"),
             steep_threshold=st.slider(
                 "Steep band (±%)", 4.0, 12.0, 6.0, 0.5,
                 help="|gradient| above this is a steep climb/descent"),
@@ -243,6 +238,9 @@ def _apply_segmentation(course: Course, seg_method: str, seg_params: dict) -> No
             name=seg_method,
             params=seg_params,
         )
+        if not _workflow.set_active_step('rider'):
+            raise RuntimeError(
+                "Applied segmentation did not unlock rider setup.")
         st.toast("Segmentation applied ✓")
         st.rerun()
     except Exception as e:

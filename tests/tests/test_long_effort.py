@@ -33,7 +33,7 @@ def optimizer():
 
 
 def _make_long_course(n_repeats: int = 6, with_clusters: bool = True) -> pd.DataFrame:
-    """Build a ~90 km course (~3 h at CP) with rolling terrain.
+    """Build a ~90 km course (~3 h at CP) with mixed terrain.
 
     Pattern per repeat (~15 km):
       flat 5 km @ 0% → climb 3 km @ 4% → flat 4 km @ 0% → descent 3 km @ -3%
@@ -155,7 +155,7 @@ class TestPiecewiseModel:
 
 class TestDurationEstimation:
     def test_long_course_detected(self, optimizer, long_cluster_course):
-        """90 km rolling course should be detected as long (>1 h)."""
+        """90 km mixed-terrain course should be detected as long (>1 h)."""
         assert optimizer.is_long_effort(long_cluster_course) == True
 
     def test_short_course_not_long(self, optimizer, short_cluster_course):
@@ -172,7 +172,7 @@ class TestDurationEstimation:
 
 class TestLongEffortConstantPower:
     def test_optimal_power_near_or_below_cp(self, optimizer, long_cluster_course):
-        """For a 3 h rolling course, optimal constant power ≈ CP (within 5%)."""
+        """For a 3 h mixed-terrain course, optimal power is near CP."""
         opt_power, opt_time, results = optimizer.optimize_constant_power(
             long_cluster_course)
         assert opt_power < CP * 1.05, (

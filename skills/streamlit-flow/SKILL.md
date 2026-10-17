@@ -51,6 +51,9 @@ Shared:
 9. **Navigation is not a commit.** Top navigation and contextual Continue
    actions may update only `vibe_active_step`; they must not revise inputs,
    stale results, or trigger API/compute work.
+   Successful confirmation actions advance to the next step: loading a course
+   opens Segment, applying segmentation opens Rider, and rider confirmation
+   opens Optimize. Failed actions remain on the current step with their error.
 10. **Preserve the last valid result.** Committed upstream changes mark results
     stale. Only a successful optimization replaces them, and only
     `reset_analysis()` intentionally clears the active analysis.

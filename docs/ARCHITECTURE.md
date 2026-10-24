@@ -84,28 +84,29 @@ single runtime path.
 - PostgreSQL is the runtime store. `app/auth_store.py` owns `users` and
   `strava_tokens`; `app/db.py` provides per-operation connections for
   `app/database.py` and `app/rider.py`.
-- PostgreSQL conversion is implemented, but ownership/backfill validation remains
-  a deployment blocker; changing the database engine alone is not user isolation.
+- PostgreSQL conversion and application-user ownership are implemented. The
+  supported initial deployment uses a fresh PostgreSQL database.
 - `courses` stores raw and processed route data plus summary metadata.
 - `course_segmentations` stores named segmentation methods, parameters, and
 	segment data associated with a course.
 - `optimization_results` caches rider inputs, optimization parameters, results,
 	and execution timing for a course/segmentation pair.
 - Rider power efforts and profile data are managed separately by `app/rider.py`.
-- Courses and segmentations currently form a shared library with `created_by`
-  provenance, not enforced private ownership. This describes current storage
-  behavior, not an approved long-term visibility policy. Optimization queries
-  filter `owner_user_id`, which is nullable and has no auth foreign key. Rider
-  cache operations currently identify rows by athlete ID; the intended
-  application-user ownership contract is not yet enforced.
+- Non-Strava courses and their terrain segmentations may be shared. Every
+  Strava-derived course is private to `courses.owner_user_id`; its segmentations
+  inherit privacy through course access checks. Rider caches and optimization
+  results are also private. All private rows use application `user_id`
+  ownership backed by `users` foreign keys. Legacy ownerless Strava courses and
+  ownerless private rows are not returned by application queries.
 
 ### PostgreSQL Migration Order
 1. Authentication: `users` and encrypted `strava_tokens` (implemented).
 2. PostgreSQL rider/course/segmentation/result storage (implemented).
 3. Enforce rider ownership by application user and define explicit shared/private
-   course and segmentation policy.
-4. Enforce result ownership and auth relationships at the schema boundary.
-5. Validate SQLite backfill and persistence parity before multi-user deployment.
+   course and segmentation policy (implemented).
+4. Enforce result ownership and auth relationships at the schema boundary
+   (implemented).
+5. External legacy SQLite import remains unsupported for the initial launch.
 
 ## Strava Identity and Authentication Boundary
 - PostgreSQL backs authentication and the rider/course/optimization stores.
@@ -114,21 +115,29 @@ single runtime path.
 	foreign key. Access and refresh tokens are encrypted with
 	`TOKEN_ENCRYPTION_KEY`; raw tokens are never stored in `.env` or logs.
 - `pages_vibe/auth_ui.py` performs the authorize/callback flow, validates OAuth
-	state, binds the returned `user_id` to the Streamlit session, and clears all
-	session state on logout.
+  state, binds the returned `user_id` to the Streamlit session, explains
+  requested scopes, and keeps logout separate from destructive disconnection.
 - Issued OAuth states are single-use, expire after ten minutes, and are stored in
   process memory so they survive the Streamlit redirect/session boundary. Until
   that store becomes shared and durable, production must use one non-sleeping web
   instance; horizontal callback routing is unsupported.
-- `app/auth.py` exchanges authorization codes and refreshes tokens per user.
-	`app/strava_calls.py` requires that user ID when resolving a token.
+- `app/auth.py` exchanges authorization codes, records accepted scopes,
+  refreshes tokens per user, deauthorizes Strava, and deletes the local user.
+  Cascading foreign keys remove tokens, rider caches, private courses and
+  segmentations, and private results. `app/strava_calls.py` requires the user ID
+  and converts scope/authentication and rate-limit responses into typed errors.
 - `Verify Strava Account` calls `/athlete` only, then stores the athlete ID,
 	name, optional profile weight, and profile-check time. It does not refresh PBs.
 - `Refresh My Strava Data` is the explicit activity/power operation. It bypasses
 	the local cache and stores best efforts, source, lookback, and a separate PB
 	refresh timestamp. Ordinary reruns only read cached identity and efforts.
-- Persisted rider profiles, best efforts, and optimization results must gain
-  enforced application-user ownership; course sharing must be explicit.
+- Persisted rider profiles, best efforts, Strava courses, and optimization
+  results use enforced application-user ownership. Only non-Strava courses and
+  their terrain segmentations use the shared-library policy described above.
+- Strava authentication is optional for the core Race Lab flow. Guest sessions
+  may read the shared course/segmentation library, upload CSV data, and use
+  prefilled or manually calculated rider profiles. Guest sessions cannot fetch
+  Strava segments, verify an athlete, or import Strava power data.
 
 ## Legacy/Reference Areas
 - archive/* and older page paths are reference-only and not canonical runtime.

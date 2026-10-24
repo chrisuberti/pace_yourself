@@ -1,279 +1,229 @@
-from app.auth import get_access_token
-import requests
+"""Strava API reads with consistent authentication and failure handling."""
+
+from __future__ import annotations
+
 import datetime
+from typing import Any
+
+import requests
+
+from app.auth import get_access_token
+
+
+STRAVA_API_ROOT = "https://www.strava.com/api/v3"
+REQUEST_TIMEOUT_SECONDS = 15
+
+
+class StravaAPIError(RuntimeError):
+    """A Strava request failed and can be shown safely to the user."""
+
+    def __init__(self, message: str, status_code: int | None = None):
+        super().__init__(message)
+        self.status_code = status_code
+
+
+class StravaScopeError(StravaAPIError):
+    """The connected grant is absent, expired, or insufficient."""
+
+
+class StravaRateLimitError(StravaAPIError):
+    """The Strava application or read quota is exhausted."""
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        limit: str | None = None,
+        usage: str | None = None,
+        read_limit: str | None = None,
+        read_usage: str | None = None,
+    ):
+        super().__init__(message, status_code=429)
+        self.limit = limit
+        self.usage = usage
+        self.read_limit = read_limit
+        self.read_usage = read_usage
+
 
 def _parse_stream_response(response_json, stream_type):
-    """
-    Parse stream response from Strava API.
-    
-    The API returns different formats depending on key_by_type parameter:
-    - key_by_type=true: Returns dict keyed by stream type (e.g., {"watts": {"data": [...]}})
-    - key_by_type=false/omitted: Returns array of stream objects (e.g., [{"type": "watts", "data": [...]}])
-    
-    This helper handles both formats.
-    """
+    """Return one stream's values from either Strava response shape."""
     if isinstance(response_json, dict):
-        # key_by_type=true format: {"watts": {"data": [...]}, "time": {"data": [...]}}
         stream_data = response_json.get(stream_type, {})
         return stream_data.get("data", [])
-    elif isinstance(response_json, list):
-        # key_by_type=false format: [{"type": "watts", "data": [...]}, ...]
+    if isinstance(response_json, list):
         for stream in response_json:
             if stream.get("type") == stream_type:
                 return stream.get("data", [])
     return []
 
 
-def fetch_segment_data(segment_id, user_id=None):
-    """
-    Fetch latitude, longitude, and altitude data for a specific segment from Strava API.
-
-    Args:
-        segment_id (int): The ID of the segment to fetch data for.
-
-    Returns:
-        dict: A dictionary with 'latlng' and 'altitude' keys containing data arrays,
-              or None if request fails.
-    """
+def _get_json(
+    path: str,
+    *,
+    user_id=None,
+    params: dict[str, Any] | None = None,
+    operation: str,
+):
     access_token = get_access_token(user_id)
-    url = f"https://www.strava.com/api/v3/segments/{segment_id}/streams"
-    headers = {"Authorization": f"Bearer {access_token}"}
-    params = {
-        "keys": "latlng,altitude",
-        "key_by_type": "true"  # Returns dict format: {"latlng": {...}, "altitude": {...}}
-    }
-
-    response = requests.get(url, headers=headers, params=params)
-    
+    response = requests.get(
+        f"{STRAVA_API_ROOT}{path}",
+        headers={"Authorization": f"Bearer {access_token}"},
+        params=params,
+        timeout=REQUEST_TIMEOUT_SECONDS,
+    )
     if response.status_code == 200:
-        data = response.json()
-        # Return normalized structure with just the data arrays
-        return {
-            "latlng": _parse_stream_response(data, "latlng"),
-            "altitude": _parse_stream_response(data, "altitude")
-        }
-    else:
-        print(f"Failed to fetch segment data: {response.status_code} - {response.text}")
-        return None
+        return response.json()
+    _raise_strava_error(response, operation)
+
+
+def _raise_strava_error(response, operation: str) -> None:
+    detail = _response_detail(response)
+    if response.status_code == 429:
+        headers = response.headers
+        limit = headers.get("X-RateLimit-Limit")
+        usage = headers.get("X-RateLimit-Usage")
+        read_limit = headers.get("X-ReadRateLimit-Limit")
+        read_usage = headers.get("X-ReadRateLimit-Usage")
+        reset_time = _next_quarter_hour_utc()
+        quotas = []
+        if usage and limit:
+            quotas.append(f"overall usage {usage} of {limit}")
+        if read_usage and read_limit:
+            quotas.append(f"read usage {read_usage} of {read_limit}")
+        quota_text = f" ({'; '.join(quotas)})" if quotas else ""
+        raise StravaRateLimitError(
+            f"Strava rate limit reached while {operation}{quota_text}. "
+            f"Try again after {reset_time}.",
+            limit=limit,
+            usage=usage,
+            read_limit=read_limit,
+            read_usage=read_usage,
+        )
+    if response.status_code in (401, 403):
+        raise StravaScopeError(
+            f"Strava access failed with {response.status_code} while "
+            f"{operation}: {detail}. Reconnect Strava and approve the "
+            "requested scopes.",
+            status_code=response.status_code,
+        )
+    raise StravaAPIError(
+        f"Strava returned {response.status_code} while {operation}: {detail}",
+        status_code=response.status_code,
+    )
+
+
+def _response_detail(response) -> str:
+    try:
+        payload = response.json()
+    except (TypeError, ValueError):
+        payload = None
+    if isinstance(payload, dict):
+        parts = []
+        if payload.get("message"):
+            parts.append(str(payload["message"]))
+        if payload.get("errors"):
+            parts.append(str(payload["errors"]))
+        if parts:
+            return " - ".join(parts)
+    return str(getattr(response, "text", "") or "No error details returned")
+
+
+def _next_quarter_hour_utc() -> str:
+    now = datetime.datetime.now(datetime.timezone.utc)
+    minutes = 15 - (now.minute % 15)
+    reset = (now + datetime.timedelta(minutes=minutes)).replace(
+        second=0, microsecond=0)
+    return reset.strftime("%H:%M UTC")
+
+
+def fetch_segment_data(segment_id, user_id=None):
+    """Fetch latitude, longitude, and altitude streams for one segment."""
+    data = _get_json(
+        f"/segments/{segment_id}/streams",
+        user_id=user_id,
+        params={"keys": "latlng,altitude", "key_by_type": "true"},
+        operation=f"fetching segment {segment_id} streams",
+    )
+    return {
+        "latlng": _parse_stream_response(data, "latlng"),
+        "altitude": _parse_stream_response(data, "altitude"),
+    }
 
 
 def get_activities(days, per_page=100, user_id=None):
-    """
-    Fetch activities from Strava API for the specified number of days.
-    
-    Args:
-        days: Number of days to look back for activities.
-        per_page: Number of activities per page (max 200, default 100).
-    
-    Returns:
-        list: List of activity objects (SummaryActivity format).
-    
-    Raises:
-        Exception: If the API request fails.
-    
-    Note:
-        Requires `activity:read` scope. Only Me activities will be filtered out
-        unless token has `activity:read_all` scope.
-    """
-    access_token = get_access_token(user_id)
+    """Fetch this athlete's activities within the requested lookback."""
     end_date = datetime.datetime.now()
     start_date = end_date - datetime.timedelta(days=days)
-    
-    # Strava uses epoch timestamps (seconds since 1970)
-    after = int(start_date.timestamp())
-    before = int(end_date.timestamp())
-
-    headers = {"Authorization": f"Bearer {access_token}"}
+    params = {
+        "after": int(start_date.timestamp()),
+        "before": int(end_date.timestamp()),
+        "per_page": min(per_page, 200),
+    }
     all_activities = []
     page = 1
-    
     while True:
-        params = {
-            "after": after,
-            "before": before,
-            "page": page,
-            "per_page": min(per_page, 200)  # API max is 200
-        }
-        
-        response = requests.get(
-            "https://www.strava.com/api/v3/athlete/activities",
-            headers=headers,
-            params=params
+        params["page"] = page
+        activities = _get_json(
+            "/athlete/activities",
+            user_id=user_id,
+            params=params,
+            operation="fetching activities",
         )
-
-        if response.status_code != 200:
-            error_msg = f"Error fetching activities: {response.status_code}"
-            try:
-                error_detail = response.json()
-                if "message" in error_detail:
-                    error_msg += f" - {error_detail['message']}"
-                if "errors" in error_detail:
-                    error_msg += f" - {error_detail['errors']}"
-            except:
-                error_msg += f" - {response.text}"
-            raise Exception(error_msg)
-
-        activities = response.json()
-        
         if not activities:
-            break  # No more activities
-            
+            break
         all_activities.extend(activities)
-        
-        if len(activities) < per_page:
-            break  # Last page
-            
+        if len(activities) < params["per_page"]:
+            break
         page += 1
-    
     return all_activities
 
 
 def get_power_stream(activity_id, user_id=None):
-    """
-    Retrieve the power stream for a specific activity.
-    
-    Args:
-        activity_id: The Strava activity ID.
-    
-    Returns:
-        list: Power values in watts (None values filtered out).
-    
-    Raises:
-        Exception: If the API request fails.
-    
-    Note:
-        Requires `activity:read` scope. Requires `activity:read_all` for Only Me activities.
-    """
-    url = f"https://www.strava.com/api/v3/activities/{activity_id}/streams"
-    headers = {"Authorization": f"Bearer {get_access_token(user_id)}"}
-    params = {
-        "keys": "watts",
-        "key_by_type": "true"  # Returns dict format: {"watts": {"data": [...]}}
-    }
-    
-    response = requests.get(url, headers=headers, params=params)
-    
-    if response.status_code == 200:
-        data = response.json()
-        power_data = _parse_stream_response(data, "watts")
-        # Filter out None values (gaps in power recording)
-        return [value for value in power_data if value is not None]
-    else:
-        error_msg = f"Error retrieving streams for activity {activity_id}: {response.status_code}"
-        try:
-            error_detail = response.json()
-            if "message" in error_detail:
-                error_msg += f" - {error_detail['message']}"
-        except:
-            error_msg += f" - {response.text}"
-        raise Exception(error_msg)
-    
-    
+    """Return non-null recorded watts for one activity."""
+    data = _get_json(
+        f"/activities/{activity_id}/streams",
+        user_id=user_id,
+        params={"keys": "watts", "key_by_type": "true"},
+        operation=f"fetching activity {activity_id} power",
+    )
+    return [
+        value
+        for value in _parse_stream_response(data, "watts")
+        if value is not None
+    ]
+
+
 def get_athlete_profile(user_id=None):
     """Return the authenticated Strava athlete profile."""
-    access_token = get_access_token(user_id)
-    url = "https://www.strava.com/api/v3/athlete"
-    headers = {"Authorization": f"Bearer {access_token}"}
-    response = requests.get(url, headers=headers)
-
-    if response.status_code == 200:
-        return response.json()
-
-    error_msg = f"Failed to fetch athlete data: {response.status_code}"
-    try:
-        error_detail = response.json()
-        if "message" in error_detail:
-            error_msg += f" - {error_detail['message']}"
-    except Exception:
-        error_msg += f" - {response.text}"
-    raise Exception(error_msg)
+    return _get_json(
+        "/athlete",
+        user_id=user_id,
+        operation="fetching the athlete profile",
+    )
 
 
 def get_athlete_id(user_id=None):
-    """
-    Retrieve the authenticated athlete's ID from the Strava API.
-    
-    Returns:
-        int: The athlete ID if successful, else None.
-    
-    Note:
-        Uses GET /athlete endpoint. Tokens with `profile:read_all` scope will receive
-        a detailed athlete representation; all others receive a summary representation.
-    """
+    """Return the authenticated athlete ID, or None for legacy callers."""
     try:
         return get_athlete_profile(user_id=user_id).get("id")
-    except Exception as error:
-        print(error)
+    except StravaAPIError:
         return None
 
 
 def fetch_segment_details(segment_id, user_id=None):
-    """
-    Fetch segment details including name, distance, elevation, etc. from Strava API.
-
-    Args:
-        segment_id (int): The ID of the segment to fetch details for.
-
-    Returns:
-        dict: A dictionary with segment details (DetailedSegment) if successful, else None.
-              Includes: id, name, activity_type, distance, average_grade, maximum_grade,
-              elevation_high, elevation_low, start_latlng, end_latlng, climb_category, etc.
-    
-    Note:
-        Requires `read_all` scope to retrieve athlete-specific segment info or private segments.
-    """
-    access_token = get_access_token(user_id)
-    url = f"https://www.strava.com/api/v3/segments/{segment_id}"
-    headers = {"Authorization": f"Bearer {access_token}"}
-
-    response = requests.get(url, headers=headers)
-    
-    if response.status_code == 200:
-        return response.json()
-    else:
-        error_msg = f"Failed to fetch segment details: {response.status_code}"
-        try:
-            error_detail = response.json()
-            if "message" in error_detail:
-                error_msg += f" - {error_detail['message']}"
-        except:
-            error_msg += f" - {response.text}"
-        print(error_msg)
-        return None
+    """Fetch one segment's metadata."""
+    return _get_json(
+        f"/segments/{segment_id}",
+        user_id=user_id,
+        operation=f"fetching segment {segment_id}",
+    )
 
 
 def get_activity_by_id(activity_id, include_all_efforts=False, user_id=None):
-    """
-    Fetch a single activity by ID with full details.
-    
-    Args:
-        activity_id: The Strava activity ID.
-        include_all_efforts: Whether to include all segment efforts (default False).
-    
-    Returns:
-        dict: DetailedActivity object if successful, else None.
-              Includes: best_efforts (for running), segment_efforts, laps, splits, etc.
-    
-    Note:
-        Requires `activity:read` for Everyone and Followers activities.
-        Requires `activity:read_all` for Only Me activities.
-    """
-    access_token = get_access_token(user_id)
-    url = f"https://www.strava.com/api/v3/activities/{activity_id}"
-    headers = {"Authorization": f"Bearer {access_token}"}
-    params = {"include_all_efforts": str(include_all_efforts).lower()}
-    
-    response = requests.get(url, headers=headers, params=params)
-    
-    if response.status_code == 200:
-        return response.json()
-    else:
-        error_msg = f"Failed to fetch activity {activity_id}: {response.status_code}"
-        try:
-            error_detail = response.json()
-            if "message" in error_detail:
-                error_msg += f" - {error_detail['message']}"
-        except:
-            error_msg += f" - {response.text}"
-        print(error_msg)
-        return None
+    """Fetch one detailed activity."""
+    return _get_json(
+        f"/activities/{activity_id}",
+        user_id=user_id,
+        params={"include_all_efforts": str(include_all_efforts).lower()},
+        operation=f"fetching activity {activity_id}",
+    )

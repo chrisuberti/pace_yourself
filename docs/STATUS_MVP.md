@@ -52,9 +52,9 @@ priorities, acceptance criteria, blockers, and execution updates belong here.
 - Use this file as the only active implementation workplan
 
 ## Active Priority
-**Next implementation phase:** MVP Streamlit UX Workplan, Phase 4 - Feedback
-and Layout Polish. Complete the phases below in order unless a
-blocking defect takes priority.
+**Next implementation phase:** MVP Streamlit UX Workplan, Phase 5 - MVP
+Validation and Migration Decision. Complete the remaining production and
+external-user checks below unless a blocking defect takes priority.
 
 | Phase | Status |
 |---|---|
@@ -62,8 +62,8 @@ blocking defect takes priority.
 | 1. Guided App Shell | Complete |
 | 2. Explicit Commit and Action Boundaries | Complete |
 | 3. Durable Results and Stale-State Model | Complete |
-| 4. Feedback and Layout Polish | Next |
-| 5. MVP Validation and Migration Decision | Queued |
+| 4. Feedback and Layout Polish | Complete |
+| 5. MVP Validation and Migration Decision | Next |
 
 Phases 1 and 2 completed 2026-08-08: the canonical runtime now renders one
 workflow step at a time from a persistent workflow navigator, shows the active setup,
@@ -103,11 +103,8 @@ deployment is considered multi-user safe.
 
 Branch consolidation completed 2026-10-15: rider profiles/PBs, courses,
 segmentations, and results now use PostgreSQL through per-operation connections.
-The engine migration does not close the deployment gate: rider cache keys still
-use athlete IDs, the course/segmentation library is global, and result ownership
-is query-scoped rather than enforced by auth foreign keys. Before multi-user
-deployment, enforce rider/result ownership, define explicit shared/private course
-policy, and validate legacy SQLite backfill.
+Private rider and result ownership was subsequently hardened with
+application-user keys and auth foreign keys.
 
 Consolidation also fixes Strava course persistence against the PostgreSQL API,
 stages imported profile weight before Streamlit widget creation, and locks short
@@ -126,29 +123,91 @@ evidence from their original worktrees, not current validation results.
 ### Outstanding Deployment Requirements and Decisions
 
 Requirements before a multi-user deployment:
-- Replace athlete-ID rider cache ownership with enforced application `user_id`
-  ownership and auth foreign keys.
-- Add an auth foreign key for optimization result ownership and reject
-  ownerless result writes in authenticated flows.
-- Validate the legacy SQLite backfill into an isolated PostgreSQL database,
-  including the expected handling of orphaned segmentations and non-finite JSON
-  values.
-- Add an integration regression proving the canonical UI constructs
-  `CourseOptimizer` with committed rider mass plus bike mass, CdA, and Crr.
 - Provision the production PostgreSQL and web service, configure
   `TOKEN_ENCRYPTION_KEY`, Strava credentials, and the registered production
   callback, then run the authenticated Course -> Segment -> Rider -> Optimize
   smoke test.
 
+Completed 2026-10-16:
+- Rider cache writes and reads use authenticated application `user_id`; the
+  schema adds `users` and rider-row foreign keys, and guest sessions never read
+  cached athlete data.
+- Persisted optimization results require an owner and carry a `users` foreign
+  key. Ownerless legacy rows are inaccessible through the application API.
+- A UI boundary regression proves committed rider mass plus bike mass, CdA, and
+  Crr construct `CourseOptimizer`.
+- The supported MVP launch path is a fresh PostgreSQL database. No legacy SQLite
+  database is present in the repository to migrate. Importing external legacy
+  SQLite data remains unsupported until its orphan and non-finite JSON handling
+  is validated separately; do not attach legacy data to the initial deployment.
+
 Product/deployment decisions that require owner input before changing direction:
-- **Course visibility:** the implementation currently provides one deduplicated,
-  globally shared course/segmentation library with creator provenance. Decide
-  whether that remains the approved MVP policy or whether private/"My Courses"
-  ownership is required before deployment.
-- **OAuth scaling:** issued OAuth states currently live in process memory. Keep
-  one non-sleeping web instance for the MVP, or approve shared durable OAuth
-  state before horizontal scaling. The current implementation is not safe for
-  callback routing across multiple instances.
+- **Course visibility (revised for Strava policy compliance):** Strava-derived
+  courses are private to the importing application user and deduplicate only
+  within that user's library. Shared demo, sample, and uploaded non-Strava
+  courses may remain ownerless. Legacy ownerless Strava rows are hidden.
+- **OAuth scaling (MVP decision):** use one non-sleeping web instance. Issued
+  OAuth states live in process memory, so horizontal callback routing remains
+  unsupported until shared durable state is added after MVP.
+
+### Strava Public-Beta Readiness
+
+Implemented compliance controls:
+- The pre-OAuth screen explains the requested `read`,
+  `activity:read_all`, and optional `profile:read_all` scopes; accepted scopes
+  are persisted and incomplete grants show a reconnect action.
+- Privacy/data-use and support links remain available from the sidebar.
+- **Log out** remains non-destructive. **Disconnect Strava and delete my data**
+  requires an explicit confirmation, calls Strava deauthorization, then deletes
+  the local user and all cascading private data. If Strava is unavailable,
+  local deletion still completes and the user is directed to Strava's connected
+  apps page.
+- Strava-derived courses and segmentations are owner-private. Shared non-Strava
+  courses remain available to guests.
+- API calls interpret authentication/scope failures and Strava's overall/read
+  rate-limit headers. HTTP 429 responses show current usage when supplied,
+  quarter-hour retry guidance, and a cached/manual-data recovery path.
+- The authorization action uses the required **Connect with Strava** wording.
+  Its unmodified orange SVG is sourced from Strava's official Connect with
+  Strava button package. Do not replace it with a custom or altered logo.
+
+Deployment and new-user checklist:
+1. Create the Render service and fresh PostgreSQL database from `render.yaml`;
+   enable backups and keep exactly one non-sleeping web instance.
+2. Generate a production `TOKEN_ENCRYPTION_KEY`. Configure it with production
+   Strava credentials, the final HTTPS `STRAVA_REDIRECT_URI`, and a monitored
+   `APP_SUPPORT_URL`.
+3. In Strava API settings, register the deployed hostname as the Authorization
+   Callback Domain. Verify that the redirect URI resolves to the canonical app
+   and that OAuth state survives the round trip.
+4. Confirm Strava athlete capacity before invitations. New apps begin at one
+   connected athlete; complete Strava's self-service steps for capacity ten and
+   submit the app for Strava review before athlete eleven.
+5. Budget and monitor application-wide quotas. The self-service upgraded limits
+   are 200 read requests per 15 minutes and 2,000 per day, plus 400 overall
+   requests per 15 minutes and 4,000 per day. Keep profile verification and PB
+   refresh explicit and separate; ordinary reruns must use cached data.
+6. Run guest and authenticated Course -> Segment -> Rider -> Optimize smoke
+   tests. With two accounts, verify that each sees only their own Strava course
+   for the same segment ID while both can see a shared sample course.
+7. Exercise denied-scope, expired-token, and mocked/controlled 429 paths. Verify
+   reconnect and retry guidance without exposing credentials or tracebacks.
+8. Exercise destructive disconnection once with Strava reachable and once with
+   deauthorization unavailable. Confirm private rows are deleted in both cases.
+9. Verify the public privacy notice, monitored support destination, Strava
+   policy links, and mobile-width layout before inviting beta users.
+10. Start with a small invited beta below the approved athlete capacity. Monitor
+    Render health, PostgreSQL storage/backups, Strava quota headers, disconnect
+    failures, and support reports before expanding.
+
+Current official references:
+- Strava getting started and athlete capacity:
+  <https://developers.strava.com/docs/getting-started/>
+- Authentication and accepted scopes:
+  <https://developers.strava.com/docs/authentication/>
+- Rate limits: <https://developers.strava.com/docs/rate-limits/>
+- API policy: <https://www.strava.com/legal/api_policy>
+- Brand guidelines: <https://developers.strava.com/guidelines/>
 
 ## Exit Criteria for MVP
 - End-to-end app path works from Course -> Segment -> Rider -> Optimize
@@ -286,6 +345,10 @@ context, label exports, and keep the prior result after failed recalculation.
 - Use compact expanders for advanced parameters and diagnostics.
 - Verify narrow-screen stacking, label wrapping, chart sizing, keyboard focus,
   and color contrast.
+- Preserve an explicit guest path: shared stored courses, CSV upload, default
+  segmentation controls, and prefilled/manual rider setup work without Strava
+  authentication. Strava fetch, verification, and athlete import remain
+  authenticated-only actions.
 
 Acceptance criteria:
 - Course -> Segment -> Rider -> Optimize can be completed without guessing the
@@ -293,6 +356,12 @@ Acceptance criteria:
 - Errors explain what the user can do next without exposing a traceback by
   default.
 - The primary workflow remains usable at desktop and narrow browser widths.
+
+Completed 2026-10-16: guest and authenticated-only actions are clearly
+separated, shared-course database failure preserves the CSV workflow with an
+actionable error, and the developer deployment toolbar is removed. A live
+desktop and 390px-wide walkthrough verified no horizontal overflow and completed
+CSV Course -> default Segment -> default Rider -> Optimize without guidance.
 
 ### Phase 5 - MVP Validation and Migration Decision
 - Add focused tests for workflow transitions, stale-result behavior, and action

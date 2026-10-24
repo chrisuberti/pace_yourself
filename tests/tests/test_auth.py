@@ -6,7 +6,12 @@ import pytest
 
 from app import auth
 from app.auth_store import AUTH_SCHEMA_SQL
+from app.database import SCHEMA_SQL
+from app.rider import RIDER_SCHEMA_SQL
 from pages_vibe.auth_ui import _rider_for_user
+from pages_vibe.tabs import tab_rider
+from pages_vibe.tabs.tab_course import _course_sources
+from pages_vibe.tabs.tab_rider import _power_source_options
 
 
 class FakeAuthStore:
@@ -29,6 +34,10 @@ class FakeAuthStore:
     def update_token(self, user_id, token_data):
         self.tokens[user_id] = token_data
         self.updated_users.append(user_id)
+
+    def delete_user(self, user_id):
+        self.tokens.pop(user_id, None)
+        return True
 
 
 @pytest.fixture
@@ -67,6 +76,7 @@ def test_oauth_exchange_persists_returned_athlete(oauth_environment):
         'access_token': 'access-one',
         'refresh_token': 'refresh-one',
         'expires_at': int(time.time()) + 3600,
+        'scope': 'read,activity:read_all',
         'athlete': {'id': 42, 'firstname': 'Ada'},
     }
 
@@ -76,6 +86,57 @@ def test_oauth_exchange_persists_returned_athlete(oauth_environment):
     assert user['strava_athlete_id'] == 42
     assert store.saved_grants[0][0]['id'] == 42
     assert store.saved_grants[0][1]['access_token'] == 'access-one'
+    assert user['missing_scopes'] == []
+
+
+def test_scope_normalization_and_required_scope_validation():
+    assert auth.parse_scopes('read, profile:read_all activity:read_all') == {
+        'read', 'profile:read_all', 'activity:read_all'}
+    assert auth.missing_required_scopes('read') == {'activity:read_all'}
+
+
+def test_require_scopes_rejects_incomplete_grant():
+    store = FakeAuthStore({
+        'user-a': {'scope': 'read', 'access_token': 'token'},
+    })
+    with pytest.raises(auth.InsufficientScope, match='activity:read_all'):
+        auth.require_scopes('user-a', 'read', 'activity:read_all', store=store)
+
+
+def test_disconnect_deauthorizes_before_local_deletion():
+    store = FakeAuthStore({
+        'user-a': {
+            'scope': 'read,activity:read_all',
+            'access_token': 'token-a',
+            'expires_at': int(time.time()) + 3600,
+        },
+    })
+    response = MagicMock(status_code=200)
+
+    with patch('app.auth.requests.post', return_value=response) as post:
+        result = auth.disconnect_and_delete_user('user-a', store=store)
+
+    assert result == {'strava_revoked': True, 'warning': None}
+    assert 'user-a' not in store.tokens
+    assert post.call_args.kwargs['headers']['Authorization'] == 'Bearer token-a'
+
+
+def test_disconnect_deletes_local_data_when_strava_revocation_fails():
+    store = FakeAuthStore({
+        'user-a': {
+            'scope': 'read,activity:read_all',
+            'access_token': 'token-a',
+            'expires_at': int(time.time()) + 3600,
+        },
+    })
+    response = MagicMock(status_code=500)
+
+    with patch('app.auth.requests.post', return_value=response):
+        result = auth.disconnect_and_delete_user('user-a', store=store)
+
+    assert result['strava_revoked'] is False
+    assert 'revoke the app in Strava settings' in result['warning']
+    assert 'user-a' not in store.tokens
 
 
 def test_refresh_is_isolated_to_requested_user(oauth_environment):
@@ -114,6 +175,15 @@ def test_token_table_is_owned_by_users():
     assert 'REFERENCES users(user_id) ON DELETE CASCADE' in normalized
 
 
+def test_private_application_data_has_auth_foreign_keys():
+    rider_schema = ' '.join(RIDER_SCHEMA_SQL.split())
+    result_schema = ' '.join(SCHEMA_SQL.split())
+
+    assert 'owner_user_id UUID UNIQUE NOT NULL REFERENCES users(user_id)' in rider_schema
+    assert 'owner_user_id UUID NOT NULL REFERENCES users(user_id)' in result_schema
+    assert 'FOREIGN KEY (owner_user_id) REFERENCES users(user_id)' in result_schema
+
+
 def test_token_access_requires_user_before_store_lookup():
     with pytest.raises(auth.AuthenticationRequired, match='Connect'):
         auth.get_access_token(None)
@@ -143,3 +213,31 @@ def test_switching_users_cannot_inherit_rider_data():
     assert rider_b['strava_name'] == 'Athlete B'
     assert rider_b['critical_power'] == 250
     assert rider_b['best_efforts'] == {}
+
+
+def test_guest_mode_excludes_strava_only_actions():
+    assert _course_sources(authenticated=False) == [
+        'Database', 'Upload CSV']
+    assert _power_source_options(authenticated=False) == [
+        'Rider Type', 'Manual Entry']
+
+
+def test_database_outage_preserves_csv_guest_path():
+    assert _course_sources(
+        authenticated=False,
+        database_available=False,
+    ) == ['Upload CSV']
+
+
+def test_authenticated_mode_includes_strava_actions():
+    assert _course_sources(authenticated=True)[-1] == 'Strava Segment'
+    assert _power_source_options(authenticated=True)[-1] == 'Strava Import'
+
+
+def test_guest_mode_never_reads_cached_strava_rider(monkeypatch):
+    cached_rider = MagicMock()
+    monkeypatch.setattr(tab_rider.st, 'session_state', {})
+    monkeypatch.setattr(tab_rider, 'get_cached_strava_rider', cached_rider)
+
+    assert tab_rider._get_session_rider_cache({}) is None
+    cached_rider.assert_not_called()

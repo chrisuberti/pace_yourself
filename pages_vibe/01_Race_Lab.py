@@ -9,6 +9,7 @@ sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..')
 
 from app.database import CourseDatabase
 from pages_vibe.auth_ui import render_authentication
+from pages_vibe.privacy_ui import render_privacy_notice
 from pages_vibe.tabs import (
     _workflow,
     tab_course,
@@ -26,9 +27,17 @@ from pages_vibe.tabs.state import (
 
 
 init_session_state()
+if st.query_params.get('view') == 'privacy':
+    render_privacy_notice()
+    st.stop()
 render_authentication()
 
-db = CourseDatabase()
+try:
+    db = CourseDatabase()
+    database_error = None
+except Exception as error:
+    db = None
+    database_error = error
 
 
 def _render_header() -> None:
@@ -163,7 +172,7 @@ def _render_active_workspace() -> None:
     st.markdown(f"## {step_titles[active_step]}")
 
     if active_step == 'course':
-        tab_course.render(db)
+        tab_course.render(db, database_error=database_error)
     elif active_step == 'segment':
         tab_segmentation.render()
     elif active_step == 'rider':

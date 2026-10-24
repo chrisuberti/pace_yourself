@@ -184,6 +184,30 @@ def test_failed_reoptimization_preserves_previous_result(
     assert not _workflow.results_are_stale()
 
 
+def test_committed_rider_physics_construct_optimizer(monkeypatch):
+    optimizer = Mock()
+    optimizer_class = Mock(return_value=optimizer)
+    monkeypatch.setattr(tab_optimization, 'CourseOptimizer', optimizer_class)
+    rider = {
+        **RIDER_DEFAULTS,
+        'weight': 72.5,
+        'bike_mass': 9.5,
+        'critical_power': 310,
+        'w_prime': 24500,
+        'cda': 0.238,
+        'crr': 0.003,
+    }
+
+    assert tab_optimization._make_optimizer(rider) is optimizer
+    optimizer_class.assert_called_once_with(
+        critical_power=310,
+        w_prime=24500,
+        mass=82.0,
+        cda=0.238,
+        crr=0.003,
+    )
+
+
 def test_explicit_reset_preserves_rider_and_auth(workflow_state):
     _commit_ready_analysis(workflow_state)
     _workflow.mark_results({'sentinel': True})

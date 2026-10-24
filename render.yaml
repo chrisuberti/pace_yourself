@@ -4,6 +4,7 @@ services:
     runtime: docker
     dockerfilePath: ./Dockerfile
     plan: starter
+    numInstances: 1
     healthCheckPath: /_stcore/health
     envVars:
       - key: DATABASE_URL
@@ -18,6 +19,8 @@ services:
         sync: false
       - key: STRAVA_REDIRECT_URI
         sync: false
+      - key: APP_SUPPORT_URL
+        value: https://github.com/chrisuberti/pace_yourself/issues
       - key: ROUTE_PATH
         value: data/sample_routes
 

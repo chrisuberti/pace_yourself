@@ -16,6 +16,7 @@ from app.rider import (
 )
 from app.strava_calls import get_athlete_profile
 from pages_vibe.tabs import _charts, _workflow
+from pages_vibe.strava_ui import render_strava_failure
 from pages_vibe.tabs.state import BIKE_MASS_DEFAULTS, get_rider
 
 
@@ -34,6 +35,11 @@ def render() -> None:
     bike_label = "TT / Tri" if r.get('bike_type') == 'TT' else r['bike_type']
 
     _render_rider_identity(r)
+    if not st.session_state.get('auth_user_id'):
+        st.info(
+            "The prefilled rider profile is ready to use. Edit only the values "
+            "you know, or continue with these defaults."
+        )
     st.divider()
 
     st.subheader("1. General Characteristics")
@@ -135,7 +141,8 @@ def _render_general(r: dict) -> None:
 
 def _render_power_profile(r: dict) -> None:
     cached_profile = _get_session_rider_cache(r)
-    source_options = ["Rider Type", "Manual Entry", "Strava Import"]
+    source_options = _power_source_options(
+        authenticated=bool(st.session_state.get('auth_user_id')))
     default_source = "Strava Import" if cached_profile else "Rider Type"
     selected_source = st.segmented_control(
         "Power profile source",
@@ -238,7 +245,7 @@ def _render_power_profile(r: dict) -> None:
                             r, rider_obj,
                             use_strava_weight=use_strava_weight)
                 except Exception as error:
-                    st.error(f"Strava refresh failed: {error}")
+                    render_strava_failure(error, "Strava PB refresh")
 
     with col_chart:
         chart_options = {}
@@ -268,6 +275,14 @@ def _render_power_profile(r: dict) -> None:
             key="rider_power_duration",
             config={'displayModeBar': False},
         )
+
+
+def _power_source_options(authenticated: bool) -> list[str]:
+    """Return power sources that are safe for the current access mode."""
+    sources = ["Rider Type", "Manual Entry"]
+    if authenticated:
+        sources.append("Strava Import")
+    return sources
 
 
 def _commit_power_profile(r: dict, rider_obj: Rider,
@@ -414,13 +429,24 @@ def _render_rider_identity(r: dict) -> None:
                 "profile:read_all authorization may be required.")
     else:
         st.markdown("### Manual rider profile")
-        st.caption("No Strava athlete has been verified or cached.")
+        if st.session_state.get('auth_user_id'):
+            st.caption("No Strava athlete has been verified or cached.")
+        else:
+            st.caption(
+                "Using local session defaults. Connect Strava from the sidebar "
+                "only if you want to import athlete data.")
+
+    if not st.session_state.get('auth_user_id'):
+        return
 
     if st.button("Verify Strava Account", width="stretch"):
         try:
             with st.spinner("Checking the authenticated Strava account…"):
-                verified = save_strava_profile(get_athlete_profile(
-                    user_id=st.session_state.get('auth_user_id')))
+                user_id = st.session_state.get('auth_user_id')
+                verified = save_strava_profile(
+                    get_athlete_profile(user_id=user_id),
+                    user_id=user_id,
+                )
             athlete_name = ' '.join(filter(None, [
                 verified.get('athlete_first_name'),
                 verified.get('athlete_last_name'),
@@ -434,7 +460,7 @@ def _render_rider_identity(r: dict) -> None:
             st.toast(f"Verified {athlete_name or 'Strava athlete'}")
             st.rerun()
         except Exception as error:
-            st.error(f"Strava account verification failed: {error}")
+            render_strava_failure(error, "Strava account verification")
 
     st.caption(
         "Verification checks the Strava account connected to this session. "
@@ -444,10 +470,9 @@ def _render_rider_identity(r: dict) -> None:
 def _get_session_rider_cache(r: dict):
     """Load only the athlete cache owned by the authenticated session."""
     auth_user = st.session_state.get('auth_user')
-    if auth_user:
-        athlete_id = str(auth_user['strava_athlete_id'])
-        return get_cached_strava_rider(athlete_id)
-    return get_cached_strava_rider(r.get('strava_athlete_id'))
+    if not auth_user:
+        return None
+    return get_cached_strava_rider(st.session_state.get('auth_user_id'))
 
 def _render_cda_info(r: dict) -> None:
     c1, c2 = st.columns([1, 2])

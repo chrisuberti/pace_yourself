@@ -27,7 +27,8 @@ class CourseManager:
         self.db = get_course_db()
     
     def import_strava_segment(self, strava_segment_id: str, 
-                            segment_data: Dict[str, Any]) -> str:
+                            segment_data: Dict[str, Any],
+                            owner_user_id: str) -> str:
         """
         Import a Strava segment and store as a course
         
@@ -42,14 +43,18 @@ class CourseManager:
         course_data = self._convert_strava_to_course(strava_segment_id, segment_data)
         
         # Store in database
-        course_id = self.db.store_course(course_data)
+        course_id = self.db.store_course(
+            course_data, owner_user_id=owner_user_id)
         
         # Create default segmentation
-        self._create_default_segmentation(course_id, course_data)
+        self._create_default_segmentation(
+            course_id, course_data, user_id=owner_user_id)
         
         return course_id
     
-    def load_course_for_optimization(self, course_id: str) -> Optional[Course]:
+    def load_course_for_optimization(
+            self, course_id: str,
+            user_id: Optional[str] = None) -> Optional[Course]:
         """
         Load course from database and convert to Course object for optimization
         
@@ -59,7 +64,7 @@ class CourseManager:
         Returns:
             Course object ready for optimization, or None if not found
         """
-        course_data = self.db.get_course(course_id)
+        course_data = self.db.get_course(course_id, user_id=user_id)
         if not course_data:
             return None
 
@@ -67,7 +72,8 @@ class CourseManager:
         return self._convert_db_to_course(course_data)
     
     def get_course_with_segmentation(self, course_id: str, 
-                                   segmentation_id: Optional[str] = None) -> Optional[Dict[str, Any]]:
+                                   segmentation_id: Optional[str] = None,
+                                   user_id: Optional[str] = None) -> Optional[Dict[str, Any]]:
         """
         Get course data with segmentation information
         
@@ -78,15 +84,17 @@ class CourseManager:
         Returns:
             Combined course and segmentation data
         """
-        course_data = self.db.get_course(course_id)
+        course_data = self.db.get_course(course_id, user_id=user_id)
         if not course_data:
             return None
         
         if segmentation_id:
-            segmentations = self.db.get_course_segmentations(course_id)
+            segmentations = self.db.get_course_segmentations(
+                course_id, user_id=user_id)
             segmentation = next((s for s in segmentations if s['segmentation_id'] == segmentation_id), None)
         else:
-            segmentation = self.db.get_default_segmentation(course_id)
+            segmentation = self.db.get_default_segmentation(
+                course_id, user_id=user_id)
         
         return {
             'course': course_data,
@@ -96,7 +104,7 @@ class CourseManager:
     
     def list_available_courses(self, user_id: Optional[str] = None) -> List[Dict[str, Any]]:
         """List all available courses for selection"""
-        return self.db.list_courses(created_by=user_id)
+        return self.db.list_courses(user_id=user_id)
     
     def _convert_strava_to_course(self, strava_segment_id: str, 
                                 segment_data: Dict[str, Any]) -> Dict[str, Any]:
@@ -151,7 +159,9 @@ class CourseManager:
         
         return course
     
-    def _create_default_segmentation(self, course_id: str, course_data: Dict[str, Any]):
+    def _create_default_segmentation(
+            self, course_id: str, course_data: Dict[str, Any],
+            user_id: Optional[str] = None):
         """Create default auto-clustering segmentation for a course"""
         # Convert to Course object for segmentation
         course = self._convert_db_to_course({'raw_gps_data': course_data['raw_gps_data'],
@@ -194,7 +204,7 @@ class CourseManager:
                 'created_by': 'system'
             }
             
-            self.db.store_segmentation(segmentation_data)
+            self.db.store_segmentation(segmentation_data, user_id=user_id)
             
         except Exception as e:
             print(f"Warning: Could not create default segmentation: {e}")
@@ -216,7 +226,8 @@ class CourseManager:
                 'is_default': True,
                 'created_by': 'system'
             }
-            self.db.store_segmentation(fallback_segmentation)
+            self.db.store_segmentation(
+                fallback_segmentation, user_id=user_id)
     
     def _decode_polyline(self, polyline_str: str) -> List[Dict[str, float]]:
         """Decode Strava polyline to GPS points"""

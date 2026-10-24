@@ -18,6 +18,8 @@ sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 load_dotenv()
 
 from app.database import CourseDatabase  # noqa: E402
+from app.db import connect  # noqa: E402
+from app.rider import initialize_rider_database  # noqa: E402
 
 DB_URL = os.getenv("PACE_TEST_DATABASE_URL") or os.getenv("DATABASE_URL")
 
@@ -88,6 +90,17 @@ def test_optimization_is_scoped_by_owner(db, sample_course):
     user_a = str(uuid.uuid4())
     user_b = str(uuid.uuid4())
     try:
+        with connect(DB_URL) as connection:
+            for user_id, athlete_id, name in (
+                (user_a, 900000001, "Owner A"),
+                (user_b, 900000002, "Owner B"),
+            ):
+                connection.execute(
+                    """INSERT INTO users (
+                           user_id, strava_athlete_id, display_name
+                       ) VALUES (%s, %s, %s)""",
+                    (user_id, athlete_id, name),
+                )
         db.cache_optimization_result({
             "course_id": course_id,
             "owner_user_id": user_a,
@@ -101,13 +114,105 @@ def test_optimization_is_scoped_by_owner(db, sample_course):
         assert db.find_cached_optimization(course_id, {}, {}, user_id=user_b) is None
     finally:
         db.delete_course(course_id)
+        with connect(DB_URL) as connection:
+            connection.execute(
+                "DELETE FROM users WHERE user_id = ANY(%s)",
+                ([user_a, user_b],),
+            )
+
+
+def test_ownerless_optimization_persistence_is_rejected(db, sample_course):
+    course_id = db.store_course(sample_course, auto_process=False)
+    try:
+        with pytest.raises(ValueError, match="ownership is required"):
+            db.cache_optimization_result({
+                "course_id": course_id,
+                "results": {"total_time": 300},
+            })
+        with pytest.raises(ValueError, match="ownership is required"):
+            db.find_cached_optimization(course_id, {}, {})
+    finally:
+        db.delete_course(course_id)
+
+
+def test_private_owner_columns_are_not_nullable(db):
+    initialize_rider_database()
+    with connect(DB_URL) as connection:
+        rows = connection.execute(
+            """SELECT table_name, is_nullable
+               FROM information_schema.columns
+               WHERE table_schema = current_schema()
+                 AND column_name = 'owner_user_id'
+                 AND table_name IN ('rider_info', 'optimization_results')"""
+        ).fetchall()
+
+    assert {row['table_name']: row['is_nullable'] for row in rows} == {
+        'optimization_results': 'NO',
+        'rider_info': 'NO',
+    }
 
 
 def test_course_dedup_on_strava_segment(db, sample_course):
-    """Storing the same Strava segment twice reuses the cached course."""
-    first = db.store_course(sample_course, auto_process=False)
+    """Strava segments dedupe per owner and remain private between owners."""
+    user_a = str(uuid.uuid4())
+    user_b = str(uuid.uuid4())
+    sample_course["course_type"] = "strava_segment"
     try:
-        second = db.store_course(sample_course, auto_process=False)
-        assert first == second
+        with connect(DB_URL) as connection:
+            connection.execute(
+                """INSERT INTO users (
+                       user_id, strava_athlete_id, display_name
+                   ) VALUES (%s, %s, %s), (%s, %s, %s)""",
+                (user_a, 910000001, "Course Owner A",
+                 user_b, 910000002, "Course Owner B"),
+            )
+        first = db.store_course(
+            sample_course, auto_process=False, owner_user_id=user_a)
+        duplicate = db.store_course(
+            sample_course, auto_process=False, owner_user_id=user_a)
+        second_owner = db.store_course(
+            sample_course, auto_process=False, owner_user_id=user_b)
+
+        assert first == duplicate
+        assert first != second_owner
+        assert db.get_course(first, user_id=user_a) is not None
+        assert db.get_course(first, user_id=user_b) is None
+        assert db.get_course(first) is None
+        assert first in {
+            course["course_id"] for course in db.list_courses(user_id=user_a)
+        }
+        assert first not in {
+            course["course_id"] for course in db.list_courses(user_id=user_b)
+        }
     finally:
-        db.delete_course(first)
+        with connect(DB_URL) as connection:
+            connection.execute(
+                "DELETE FROM users WHERE user_id = ANY(%s)",
+                ([user_a, user_b],),
+            )
+
+
+def test_strava_course_requires_owner(db, sample_course):
+    sample_course["course_type"] = "strava_segment"
+    with pytest.raises(ValueError, match="require owner_user_id"):
+        db.store_course(sample_course, auto_process=False)
+
+
+def test_legacy_ownerless_strava_course_is_hidden(db, sample_course):
+    sample_course["course_type"] = "test"
+    course_id = db.store_course(sample_course, auto_process=False)
+    try:
+        with connect(DB_URL) as connection:
+            connection.execute(
+                """UPDATE courses SET course_type = 'strava_segment',
+                   owner_user_id = NULL WHERE course_id = %s""",
+                (course_id,),
+            )
+        assert db.get_course(course_id) is None
+        assert course_id not in {
+            course["course_id"] for course in db.list_courses()
+        }
+    finally:
+        with connect(DB_URL) as connection:
+            connection.execute(
+                "DELETE FROM courses WHERE course_id = %s", (course_id,))

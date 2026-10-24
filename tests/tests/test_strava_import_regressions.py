@@ -51,17 +51,22 @@ def test_segment_persistence_uses_store_course_deduplication(monkeypatch):
     monkeypatch.setattr(tab_course, "get_course_db", lambda: db)
     gps = [{"lat": 51.0, "lon": -1.0, "ele": 20.0}]
 
-    assert tab_course._persist_strava_segment(" 123 ", "Climb", gps) == "cached-course"
-    assert tab_course._persist_strava_segment("123", "Climb", gps) == "cached-course"
+    assert tab_course._persist_strava_segment(
+        " 123 ", "Climb", gps, "user-1") == "cached-course"
+    assert tab_course._persist_strava_segment(
+        "123", "Climb", gps, "user-1") == "cached-course"
 
     assert db.store_course.call_count == 2
-    db.store_course.assert_called_with({
-        "name": "Climb",
-        "strava_segment_id": "123",
-        "raw_gps_data": gps,
-        "created_by": "strava",
-        "course_type": "strava_segment",
-    })
+    db.store_course.assert_called_with(
+        {
+            "name": "Climb",
+            "strava_segment_id": "123",
+            "raw_gps_data": gps,
+            "created_by": "strava",
+            "course_type": "strava_segment",
+        },
+        owner_user_id="user-1",
+    )
 
 
 def test_segment_import_commits_course_only_on_explicit_fetch(monkeypatch):
@@ -179,4 +184,4 @@ def test_rider_refresh_stages_weight_before_widget_rerun(
     assert app.number_input(key="rider_general_weight").value == 76.0
     rider_factory.assert_called_once()
     verify.assert_not_called()
-    assert {call.args for call in cache.call_args_list} == {("42",)}
+    assert {call.args for call in cache.call_args_list} == {("rider-owner",)}

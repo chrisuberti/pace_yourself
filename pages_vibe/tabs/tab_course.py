@@ -11,22 +11,38 @@ import streamlit as st
 
 from app.course import Course
 from app.database import CourseDatabase, get_course_db
+from pages_vibe.strava_ui import render_strava_failure
 from pages_vibe.tabs import _charts, _workflow
 from pages_vibe.tabs.state import get_course
 
 
 # ── Public entry point ──────────────────────────────────────────────────────
 
-def render(db: CourseDatabase) -> None:
+def render(db: CourseDatabase | None, database_error: Exception | None = None) -> None:
+    authenticated = bool(st.session_state.get('auth_user_id'))
+    sources = _course_sources(
+        authenticated, database_available=db is not None)
     col_source, col_loader = st.columns([1, 3])
 
     with col_source:
         source = st.radio(
-            "Course source", ["Database", "Upload CSV", "Strava Segment"],
+            "Course source", sources,
             horizontal=False, label_visibility="collapsed",
         )
+        if not authenticated:
+            st.caption(
+                "Connect Strava from the sidebar to fetch a new segment. "
+                "Shared non-Strava courses remain available without connecting."
+            )
 
     with col_loader:
+        if database_error is not None:
+            st.error(
+                "The shared course library is temporarily unavailable. "
+                "You can continue by uploading a CSV."
+            )
+            with st.expander("Technical details"):
+                st.code(str(database_error))
         if source == "Database":
             _render_database_loader(db)
         elif source == "Upload CSV":
@@ -43,23 +59,43 @@ def render(db: CourseDatabase) -> None:
     _render_course_overview(course)
 
 
+def _course_sources(
+    authenticated: bool,
+    database_available: bool = True,
+) -> list[str]:
+    """Return course sources available for the current access mode."""
+    sources = ["Database", "Upload CSV"] if database_available else ["Upload CSV"]
+    if authenticated:
+        sources.append("Strava Segment")
+    return sources
+
+
 # ── Database loader ─────────────────────────────────────────────────────────
 
 def _render_database_loader(db: CourseDatabase) -> None:
     try:
-        all_courses = db.list_courses()
+        all_courses = db.list_courses(
+            user_id=st.session_state.get('auth_user_id'))
     except Exception:
         all_courses = []
 
     if not all_courses:
-        st.info("No courses in the database yet. Upload a CSV or fetch from Strava.")
+        message = "No courses in the shared library yet. Upload a CSV"
+        if st.session_state.get('auth_user_id'):
+            message += " or fetch a segment from Strava"
+        st.info(f"{message}.")
         return
 
     labels: dict[str, str] = {}
     for c in all_courses:
         dist = c.get('total_distance_km', 0) or 0
         name = c.get('course_name', 'Unnamed')
-        labels[f"{name} · {dist:.1f} km"] = c['course_id']
+        privacy = (
+            'Private Strava'
+            if c.get('course_type') == 'strava_segment'
+            else 'Shared'
+        )
+        labels[f"{name} · {dist:.1f} km · {privacy}"] = c['course_id']
 
     current_id = st.session_state.get('vibe_course_id')
     current_index = 0
@@ -84,7 +120,8 @@ def _render_database_loader(db: CourseDatabase) -> None:
 
 
 def _load_course_from_db(db: CourseDatabase, course_id: str, label: str) -> None:
-    cdata = db.get_course(course_id)
+    cdata = db.get_course(
+        course_id, user_id=st.session_state.get('auth_user_id'))
     if not cdata:
         st.error("Course not found in database.")
         return
@@ -208,7 +245,8 @@ def _render_strava_fetch() -> None:
                 df_raw.rename(columns={'ele': 'altitude'}, inplace=True)
 
             course = Course(df_raw)
-            course_id = _persist_strava_segment(seg_id_input, seg_name, raw_gps)
+            course_id = _persist_strava_segment(
+                seg_id_input, seg_name, raw_gps, auth_user_id)
 
             _commit_course_and_advance(
                 course=course, course_id=course_id, course_name=seg_name)
@@ -217,9 +255,7 @@ def _render_strava_fetch() -> None:
         st.toast(f"Fetched & saved: {seg_name}")
         st.rerun()
     except Exception as e:
-        st.error(f"Strava fetch failed: {e}")
-        st.info("Check your STRAVA_CLIENT_ID, STRAVA_CLIENT_SECRET, "
-                "and tokens in `.env`.")
+        render_strava_failure(e, "Strava segment fetch")
 
 
 def _commit_course_and_advance(course: Course, course_id: str | None,
@@ -234,17 +270,22 @@ def _commit_course_and_advance(course: Course, course_id: str | None,
         raise RuntimeError("Loaded course did not unlock segmentation.")
 
 
-def _persist_strava_segment(seg_id: str, seg_name: str, raw_gps: list) -> str:
+def _persist_strava_segment(
+        seg_id: str, seg_name: str, raw_gps: list,
+        owner_user_id: str) -> str:
     """Upsert a Strava segment into the courses DB. Returns course_id."""
     db = get_course_db()
     strava_id = str(seg_id).strip()
-    return db.store_course({
-        'name': seg_name,
-        'strava_segment_id': strava_id,
-        'raw_gps_data': raw_gps,
-        'created_by': 'strava',
-        'course_type': 'strava_segment',
-    })
+    return db.store_course(
+        {
+            'name': seg_name,
+            'strava_segment_id': strava_id,
+            'raw_gps_data': raw_gps,
+            'created_by': 'strava',
+            'course_type': 'strava_segment',
+        },
+        owner_user_id=owner_user_id,
+    )
 
 
 # ── Overview ────────────────────────────────────────────────────────────────

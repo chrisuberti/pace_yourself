@@ -2,25 +2,41 @@
 
 from __future__ import annotations
 
+import base64
+from html import escape
+from pathlib import Path
+
 import streamlit as st
 
 from app.auth import (
     authentication_configured,
     complete_oauth,
     create_oauth_state,
+    disconnect_and_delete_user,
     get_auth_store,
     get_authorization_url,
+    missing_required_scopes,
+)
+from pages_vibe.privacy_ui import (
+    render_oauth_consent_summary,
+    render_privacy_sidebar,
 )
 from pages_vibe.tabs import _workflow
 from pages_vibe.tabs.state import RIDER_DEFAULTS
 
 
+STRAVA_CONNECT_ASSET = (
+    Path(__file__).parent / 'assets' / 'btn_strava_connect_with_orange.svg')
+
+
 def render_authentication() -> None:
-    """Bind one PostgreSQL-backed Strava user to this Streamlit session."""
+    """Bind a Strava user or allow an isolated guest workflow."""
+    render_privacy_sidebar()
     if not authentication_configured():
+        st.session_state.guest_mode = True
         st.sidebar.caption(
-            'Local mode · Strava login unavailable until PostgreSQL auth '
-            'environment variables are configured.')
+            'Guest mode · Shared courses, CSV uploads, and manual rider setup '
+            'are available. Strava login is not configured.')
         return
 
     code = st.query_params.get('code')
@@ -39,7 +55,10 @@ def render_authentication() -> None:
             st.stop()
         st.session_state.auth_user_id = str(user['user_id'])
         st.session_state.auth_user = user
+        st.session_state.guest_mode = False
         _bind_user_to_rider(user)
+        if user.get('missing_scopes'):
+            st.session_state.strava_scope_warning = user['missing_scopes']
         st.session_state.oauth_state = None
         st.query_params.clear()
         st.rerun()
@@ -49,34 +68,125 @@ def render_authentication() -> None:
         user = get_auth_store().get_user(user_id)
         if user:
             st.session_state.auth_user = user
+            st.session_state.guest_mode = False
             _bind_user_to_rider(user)
+            _render_scope_warning(user)
             st.sidebar.caption(f"Connected as {user['display_name']}")
             if st.sidebar.button('Log out', width='stretch'):
                 st.session_state.clear()
                 st.query_params.clear()
                 st.rerun()
+            _render_disconnect_controls(user_id)
             return
         st.session_state.auth_user_id = None
         st.session_state.auth_user = None
 
+    if st.session_state.get('guest_mode'):
+        _render_guest_sidebar()
+        return
+
+    disconnect_status = st.query_params.get('disconnected')
+    if disconnect_status == 'revoked':
+        st.success('Strava was disconnected and your private data was deleted.')
+        st.query_params.clear()
+    elif disconnect_status == 'local_only':
+        st.warning(
+            'Your local data was deleted, but Strava revocation could not be '
+            'confirmed. Revoke Pace Yourself in Strava Settings > My Apps.')
+        st.query_params.clear()
+
     st.markdown('## Connect Strava')
     st.caption(
-        'Sign in with Strava to load your athlete profile, activities, and '
-        'power data. Your credentials are stored per user in PostgreSQL.')
+        'Connect Strava to fetch new segments and import your athlete profile, '
+        'activities, and power data. You can also use the shared course library '
+        'with the prefilled rider and segmentation defaults without connecting.'
+    )
+    render_oauth_consent_summary()
     if not st.session_state.get('oauth_state'):
         st.session_state.oauth_state = create_oauth_state()
-    st.link_button(
-        'Continue with Strava',
-        get_authorization_url(st.session_state.oauth_state),
-        type='primary',
-        width='stretch',
-    )
+    login_col, guest_col = st.columns(2)
+    with login_col:
+        _render_connect_with_strava(
+            get_authorization_url(st.session_state.oauth_state))
+        st.caption('You will review and approve access on Strava.')
+    with guest_col:
+        if st.button('Continue without Strava', width='stretch'):
+            st.session_state.guest_mode = True
+            st.session_state.auth_user_id = None
+            st.session_state.auth_user = None
+            st.rerun()
     st.stop()
+
+
+def _render_guest_sidebar() -> None:
+    """Show guest status and an optional upgrade path to Strava."""
+    st.sidebar.caption(
+        'Guest mode · Shared courses and manual rider setup are available.')
+    if not st.session_state.get('oauth_state'):
+        st.session_state.oauth_state = create_oauth_state()
+    with st.sidebar:
+        _render_connect_with_strava(
+            get_authorization_url(st.session_state.oauth_state))
+
+
+def _render_scope_warning(user) -> None:
+    missing = missing_required_scopes(user.get('scope'))
+    if not missing:
+        return
+    st.sidebar.warning(
+        'Strava access is incomplete. Reconnect and approve: '
+        + ', '.join(sorted(missing)))
+    if not st.session_state.get('oauth_state'):
+        st.session_state.oauth_state = create_oauth_state()
+    with st.sidebar:
+        _render_connect_with_strava(
+            get_authorization_url(st.session_state.oauth_state))
+
+
+def _render_connect_with_strava(authorization_url: str) -> None:
+    """Render Strava's unmodified official OAuth button asset."""
+    encoded_asset = base64.b64encode(
+        STRAVA_CONNECT_ASSET.read_bytes()).decode('ascii')
+    st.markdown(
+        (
+            f'<a href="{escape(authorization_url, quote=True)}">'
+            f'<img src="data:image/svg+xml;base64,{encoded_asset}" '
+            'alt="Connect with Strava" width="237" height="48"></a>'
+        ),
+        unsafe_allow_html=True,
+    )
+
+
+def _render_disconnect_controls(user_id: str) -> None:
+    with st.sidebar.expander('Disconnect Strava and delete my data'):
+        st.warning(
+            'This permanently deletes your tokens, rider cache, private Strava '
+            'courses, and private optimization results.')
+        confirmed = st.checkbox(
+            'I understand this cannot be undone',
+            key='confirm_delete_private_data',
+        )
+        if st.button(
+                'Disconnect and delete',
+                type='primary',
+                disabled=not confirmed,
+                width='stretch'):
+            try:
+                result = disconnect_and_delete_user(user_id)
+            except Exception as error:
+                st.error(f'Account deletion failed: {error}')
+                return
+            st.session_state.clear()
+            st.query_params.clear()
+            st.query_params['disconnected'] = (
+                'revoked' if result['strava_revoked'] else 'local_only')
+            st.rerun()
 
 
 def _begin_login() -> None:
     st.session_state.auth_user_id = None
     st.session_state.auth_user = None
+    st.session_state.guest_mode = False
     st.session_state.oauth_state = create_oauth_state()
     st.query_params.clear()
     st.rerun()

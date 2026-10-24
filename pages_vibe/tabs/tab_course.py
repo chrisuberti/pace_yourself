@@ -11,6 +11,11 @@ import streamlit as st
 
 from app.course import Course
 from app.database import CourseDatabase, get_course_db
+from app.starter_courses import (
+    STARTER_COURSES,
+    build_starter_course_frame,
+    get_starter_course,
+)
 from pages_vibe.tabs import _charts, _workflow
 from pages_vibe.tabs.state import get_course
 
@@ -22,12 +27,15 @@ def render(db: CourseDatabase) -> None:
 
     with col_source:
         source = st.radio(
-            "Course source", ["Database", "Upload CSV", "Strava Segment"],
+            "Course source",
+            ["Starter Courses", "Database", "Upload CSV", "Strava Segment"],
             horizontal=False, label_visibility="collapsed",
         )
 
     with col_loader:
-        if source == "Database":
+        if source == "Starter Courses":
+            _render_starter_course_loader()
+        elif source == "Database":
             _render_database_loader(db)
         elif source == "Upload CSV":
             _render_csv_upload()
@@ -41,6 +49,59 @@ def render(db: CourseDatabase) -> None:
 
     st.divider()
     _render_course_overview(course)
+
+
+# ── Starter courses ─────────────────────────────────────────────────────────
+
+def _render_starter_course_loader() -> None:
+    labels = {
+        (
+            f"{starter.name} · {starter.distance_m / 1000:.1f} km · "
+            f"{starter.elevation_gain_m:.0f} m gain"
+        ): starter.slug
+        for starter in STARTER_COURSES
+    }
+
+    with st.form("starter_course_form"):
+        pick = st.selectbox("Starter course", labels, label_visibility="collapsed")
+        load_course = st.form_submit_button(
+            "Load Starter Course",
+            type="primary",
+            width="stretch",
+        )
+
+    starter = get_starter_course(labels[pick])
+    st.caption(f"{starter.location} · {starter.description}")
+    if starter.is_virtual:
+        st.caption(
+            "Virtual route profile with a schematic map; no real-world GPS "
+            "location is implied."
+        )
+    else:
+        st.caption(
+            "Real-world GPS geometry from OpenStreetMap with a normalized "
+            "elevation profile based on the linked public course reference."
+        )
+    st.link_button("View segment reference", starter.segment_url)
+
+    if load_course:
+        _load_starter_course(starter.slug)
+
+
+def _load_starter_course(slug: str) -> None:
+    starter = get_starter_course(slug)
+    try:
+        course = Course(build_starter_course_frame(slug))
+        course.starter_course = starter
+        _commit_course_and_advance(
+            course=course,
+            course_id=f"starter:{starter.slug}",
+            course_name=starter.name,
+        )
+        st.toast(f"Loaded: {starter.name}")
+        st.rerun()
+    except Exception as error:
+        st.error(f"Failed to load starter course: {error}")
 
 
 # ── Database loader ─────────────────────────────────────────────────────────
@@ -153,6 +214,11 @@ def _render_csv_upload() -> None:
 # ── Strava fetch ────────────────────────────────────────────────────────────
 
 def _render_strava_fetch() -> None:
+    auth_user_id = st.session_state.get('auth_user_id')
+    if not auth_user_id:
+        st.info("Connect Strava before fetching one of your accessible segments.")
+        return
+
     with st.form("strava_course_form"):
         seg_id_input = st.text_input(
             "Strava Segment ID",
@@ -180,7 +246,6 @@ def _render_strava_fetch() -> None:
         with st.spinner("Fetching from Strava…"):
             from app.strava_calls import fetch_segment_data, fetch_segment_details
 
-            auth_user_id = st.session_state.get('auth_user_id')
             details = fetch_segment_details(
                 seg_id_input, user_id=auth_user_id)
             seg_name = (details.get('name', f'Segment {seg_id_input}')
@@ -251,6 +316,15 @@ def _persist_strava_segment(seg_id: str, seg_name: str, raw_gps: list) -> str:
 
 def _render_course_overview(course: Course) -> None:
     cdf = course.df
+    starter = getattr(course, "starter_course", None)
+
+    if starter is not None:
+        source_description = (
+            "Virtual profile and schematic geometry"
+            if starter.is_virtual
+            else "OpenStreetMap GPS geometry with a normalized elevation profile"
+        )
+        st.caption(f"{source_description} · {starter.location}")
 
     total_dist_m = (cdf['cumulative_distance'].max()
                     if 'cumulative_distance' in cdf.columns else 0)
@@ -272,7 +346,21 @@ def _render_course_overview(course: Course) -> None:
     has_elev = ('cumulative_distance' in cdf.columns
                 and 'altitude' in cdf.columns)
 
-    if has_latlon and has_elev:
+    if starter is not None and has_latlon and has_elev:
+        col_map, col_elev = st.columns(2)
+        with col_map:
+            map_builder = (
+                _charts.build_virtual_course_map
+                if starter.is_virtual
+                else _charts.build_gps_map
+            )
+            st.plotly_chart(map_builder(cdf), width="stretch")
+        with col_elev:
+            st.plotly_chart(_charts.build_elevation_profile(cdf),
+                            width="stretch")
+        st.link_button("View segment reference", starter.segment_url)
+        st.link_button("Why this segment was selected", starter.research_url)
+    elif has_latlon and has_elev:
         col_map, col_elev = st.columns(2)
         with col_map:
             st.plotly_chart(_charts.build_gps_map(cdf), width="stretch")

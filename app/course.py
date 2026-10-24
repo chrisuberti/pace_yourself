@@ -369,10 +369,14 @@ class Course:
         # (needed to determine appropriate smoothing window)
         self.df["delta_lat"] = self.df["lat"].diff()
         self.df["delta_lon"] = self.df["lon"].diff()
-        self.df["distance"] = (self.df["delta_lat"]**2 + self.df["delta_lon"]**2)**0.5
-        self.df["distance"] = self.df["distance"].fillna(0)
-        # Convert the lat/lon distance to meters
-        self.df["distance"] = self.df["distance"] * 111139
+        mean_latitude_rad = np.radians(
+            (self.df["lat"] + self.df["lat"].shift()) / 2
+        )
+        delta_lat_m = self.df["delta_lat"] * 111139
+        delta_lon_m = (
+            self.df["delta_lon"] * 111139 * np.cos(mean_latitude_rad)
+        )
+        self.df["distance"] = np.hypot(delta_lat_m, delta_lon_m).fillna(0)
         # Calculate the cumulative distance
         self.df["cumulative_distance"] = self.df["distance"].cumsum()
         
@@ -404,8 +408,9 @@ class Course:
         
         # Calculate gradient using smoothed altitude
         self.df["delta_altitude"] = self.df["altitude_smoothed"].diff()
-        self.df["height_gain"] = self.df["altitude"].diff().clip(lower=0)  # Use raw for actual gain
-        self.df["height_loss"] = -self.df["altitude"].diff().clip(upper=0)
+        altitude_change = self.df["altitude_smoothed"].diff()
+        self.df["height_gain"] = altitude_change.clip(lower=0)
+        self.df["height_loss"] = -altitude_change.clip(upper=0)
         
         # Gradient as rise/run over a fixed DISTANCE window, not point-to-point.
         # Point-to-point division by tiny GPS steps (some <0.5 m) produced spikes

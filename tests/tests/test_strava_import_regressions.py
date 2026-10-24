@@ -114,6 +114,18 @@ def test_segment_import_commits_course_only_on_explicit_fetch(monkeypatch):
     assert details.call_count == streams.call_count == db.store_course.call_count == 1
 
 
+def test_segment_import_requires_authenticated_user():
+    app = AppTest.from_string(COURSE_APP)
+    app.run()
+
+    assert not list(app.exception)
+    assert not list(app.text_input)
+    assert any(
+        "Connect Strava" in info.value
+        for info in app.info
+    )
+
+
 @pytest.mark.parametrize(
     ("profile_weight", "use_weight", "expected_weight"),
     [(72.5, True, 72.5), (72.5, False, 80.0), (None, True, 80.0)],

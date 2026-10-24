@@ -64,6 +64,27 @@ def build_gps_map(cdf: pd.DataFrame) -> go.Figure:
     return fig
 
 
+def build_virtual_course_map(cdf: pd.DataFrame) -> go.Figure:
+    """Draw virtual route geometry without placing it on a real-world map."""
+    fig = go.Figure(go.Scatter(
+        x=cdf['lon'],
+        y=cdf['lat'],
+        mode='lines',
+        line=dict(width=4, color='#ff4b4b'),
+        hoverinfo='skip',
+    ))
+    fig.update_layout(
+        height=380,
+        template='plotly_dark',
+        xaxis=dict(visible=False, scaleanchor='y', scaleratio=1),
+        yaxis=dict(visible=False),
+        margin=dict(l=10, r=10, t=35, b=10),
+        title=dict(text='Virtual course map', x=0.5, xanchor='center'),
+        showlegend=False,
+    )
+    return fig
+
+
 def build_elevation_profile(cdf: pd.DataFrame) -> go.Figure:
     """Elevation profile chart for the loaded course.
 

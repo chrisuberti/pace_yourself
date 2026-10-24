@@ -217,7 +217,7 @@ def test_switching_users_cannot_inherit_rider_data():
 
 def test_guest_mode_excludes_strava_only_actions():
     assert _course_sources(authenticated=False) == [
-        'Database', 'Upload CSV']
+        'Starter Courses', 'Database', 'Upload CSV']
     assert _power_source_options(authenticated=False) == [
         'Rider Type', 'Manual Entry']
 
@@ -226,7 +226,7 @@ def test_database_outage_preserves_csv_guest_path():
     assert _course_sources(
         authenticated=False,
         database_available=False,
-    ) == ['Upload CSV']
+    ) == ['Starter Courses', 'Upload CSV']
 
 
 def test_authenticated_mode_includes_strava_actions():

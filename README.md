@@ -15,6 +15,8 @@ Legacy files under `archive/` are reference-only and are being deprecated in sta
 
 ## MVP Scope (3-4 Weeks)
 - Course load/import and segmentation
+- Starter courses usable before authentication: real OSM-based GPS/elevation
+  tracks selected from public segment references, plus schematic Zwift profiles
 - Rider setup
 - Constant vs variable pacing comparison
 - Database-backed course persistence

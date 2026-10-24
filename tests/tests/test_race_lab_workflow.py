@@ -4,6 +4,7 @@ from contextlib import nullcontext
 from types import SimpleNamespace
 from unittest.mock import Mock
 
+import numpy as np
 import pandas as pd
 import pytest
 
@@ -14,6 +15,7 @@ from pages_vibe.tabs import (
     tab_segmentation,
 )
 from pages_vibe.tabs.state import RIDER_DEFAULTS, SESSION_DEFAULTS
+from app.starter_courses import STARTER_COURSES, build_starter_course_frame
 
 
 class _State(dict):
@@ -77,6 +79,42 @@ def test_successful_course_confirmation_advances_to_segmentation(
         course, 'course-1', 'Test Course')
 
     assert workflow_state['vibe_course'] is course
+    assert workflow_state['vibe_active_step'] == 'segment'
+
+
+def test_starter_courses_build_without_authenticated_strava_data():
+    for starter in STARTER_COURSES:
+        frame = build_starter_course_frame(starter.slug)
+
+        assert list(frame.columns) == ['lat', 'lon', 'altitude']
+        assert len(frame) >= 90
+        assert frame.isna().sum().sum() == 0
+
+        mean_latitude = (
+            (frame['lat'] + frame['lat'].shift()) / 2
+        ).map(np.radians)
+        delta_lat_m = frame['lat'].diff() * 111_139
+        delta_lon_m = (
+            frame['lon'].diff() * 111_139 * mean_latitude.map(np.cos)
+        )
+        distance_m = np.hypot(delta_lat_m, delta_lon_m).fillna(0).sum()
+        assert distance_m == pytest.approx(starter.distance_m, rel=0.03)
+
+
+def test_starter_course_load_commits_and_advances(
+    workflow_state,
+    monkeypatch,
+):
+    monkeypatch.setattr(tab_course.st, 'toast', Mock())
+    monkeypatch.setattr(tab_course.st, 'rerun', Mock())
+
+    starter = STARTER_COURSES[0]
+    tab_course._load_starter_course(starter.slug)
+
+    course = workflow_state['vibe_course']
+    assert course.starter_course is starter
+    assert workflow_state['vibe_course_id'] == f'starter:{starter.slug}'
+    assert workflow_state['vibe_course_name'] == starter.name
     assert workflow_state['vibe_active_step'] == 'segment'
 
 

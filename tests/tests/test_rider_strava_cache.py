@@ -14,13 +14,24 @@ load_dotenv()
 # These tests mutate rider tables, so they require an ISOLATED throwaway database
 # (e.g. `createdb pace_yourself_test`), not the development database.
 TEST_DB_URL = os.getenv("PACE_TEST_DATABASE_URL")
-TEST_RIDER_IDS = ["42", "77", "88", "99", "100"]
+TEST_USERS = {
+    42: "00000000-0000-0000-0000-000000000042",
+    77: "00000000-0000-0000-0000-000000000077",
+    88: "00000000-0000-0000-0000-000000000088",
+    99: "00000000-0000-0000-0000-000000000099",
+    100: "00000000-0000-0000-0000-000000000100",
+}
+TEST_RIDER_IDS = list(TEST_USERS.values())
 
 
 def _cleanup():
     with connect(TEST_DB_URL) as conn:
         conn.execute("DELETE FROM best_efforts WHERE rider_id = ANY(%s)", (TEST_RIDER_IDS,))
         conn.execute("DELETE FROM rider_info WHERE rider_id = ANY(%s)", (TEST_RIDER_IDS,))
+        conn.execute(
+            "DELETE FROM users WHERE user_id = ANY(%s)",
+            (TEST_RIDER_IDS,),
+        )
 
 
 @pytest.fixture
@@ -33,6 +44,14 @@ def rider_db(monkeypatch):
     monkeypatch.setenv("DATABASE_URL", TEST_DB_URL)
     rider_module.initialize_rider_database()
     _cleanup()
+    with connect(TEST_DB_URL) as conn:
+        for athlete_id, user_id in TEST_USERS.items():
+            conn.execute(
+                """INSERT INTO users (
+                       user_id, strava_athlete_id, display_name
+                   ) VALUES (%s, %s, %s)""",
+                (user_id, athlete_id, f"Test Rider {athlete_id}"),
+            )
     yield
     _cleanup()
 
@@ -52,7 +71,7 @@ def test_profile_verification_does_not_claim_power_refresh(rider_db):
         'firstname': 'Profile',
         'lastname': 'Only',
         'weight': 68.2,
-    })
+    }, TEST_USERS[77])
 
     assert cached['athlete_first_name'] == 'Profile'
     assert cached['athlete_last_name'] == 'Only'
@@ -67,7 +86,7 @@ def test_forced_refresh_bypasses_cache_and_stores_hour_power(rider_db):
         'id': 88,
         'firstname': 'Old',
         'lastname': 'Cache',
-    })
+    }, TEST_USERS[88])
     efforts = {
         30: 700.0,
         60: 500.0,
@@ -90,9 +109,10 @@ def test_forced_refresh_bypasses_cache_and_stores_hour_power(rider_db):
             weight=74.0,
             days=90,
             force_strava_refresh=True,
+            auth_user_id=TEST_USERS[88],
         )
 
-    cached = rider_module.get_cached_strava_rider('88')
+    cached = rider_module.get_cached_strava_rider(TEST_USERS[88])
     assert rider.athlete_first_name == 'Fresh'
     assert rider.best_efforts[3600] == 255.0
     assert cached['best_efforts'][3600] == 255.0
@@ -106,26 +126,30 @@ def test_cached_identity_and_key_pbs_render_without_api_call(rider_db):
         'id': 99,
         'firstname': 'Cached',
         'lastname': 'Rider',
-    })
+    }, TEST_USERS[99])
     with connect(TEST_DB_URL) as conn:
         for duration, power in [(60, 500.0), (300, 350.0), (1200, 290.0), (3600, 255.0)]:
             conn.execute(
                 """INSERT INTO best_efforts
                    (rider_id, duration, power, source, refreshed_at)
                    VALUES (%s, %s, %s, 'strava', '2025-02-03T04:05:06+00:00')""",
-                ('99', duration, power),
+                (TEST_USERS[99], duration, power),
             )
         conn.execute(
             """UPDATE rider_info
                SET strava_last_synced_at = '2025-02-03T04:05:06+00:00',
                    strava_lookback_days = 90
-               WHERE rider_id = '99'"""
+               WHERE rider_id = %s""",
+            (TEST_USERS[99],),
         )
 
     with patch(
             'pages_vibe.tabs.tab_rider.get_athlete_profile',
             side_effect=AssertionError('ordinary render called Strava')):
-        app = AppTest.from_string(RIDER_APP).run()
+        app = AppTest.from_string(RIDER_APP)
+        app.session_state['auth_user_id'] = TEST_USERS[99]
+        app.session_state['auth_user'] = {'strava_athlete_id': 99}
+        app.run()
 
     assert not list(app.exception)
     assert app.session_state['rider_power_source_mode'] == 'Strava Import'
@@ -205,6 +229,8 @@ def test_account_verification_preserves_stable_optimization_results(rider_db):
         'power_source': None,
     }
     app.session_state['vibe_optimization_results'] = {'sentinel': True}
+    app.session_state['auth_user_id'] = TEST_USERS[100]
+    app.session_state['auth_user'] = {'strava_athlete_id': 100}
     profile = {'id': 100, 'firstname': 'Verified', 'lastname': 'Rider'}
 
     with patch(

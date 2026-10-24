@@ -20,6 +20,8 @@ from app.strava_calls import (
     get_athlete_id,
     fetch_segment_details,
     get_activity_by_id,
+    StravaRateLimitError,
+    StravaScopeError,
 )
 
 
@@ -277,11 +279,35 @@ class TestGetActivities:
         mock_response.json.return_value = {"message": "Authorization Error", "errors": []}
         mock_get.return_value = mock_response
         
-        with pytest.raises(Exception) as exc_info:
+        with pytest.raises(StravaScopeError) as exc_info:
             get_activities(days=30)
         
         assert "401" in str(exc_info.value)
         assert "Authorization Error" in str(exc_info.value)
+
+    @patch('app.strava_calls.get_access_token')
+    @patch('app.strava_calls.requests.get')
+    def test_get_activities_rate_limit_includes_quota_and_retry(
+            self, mock_get, mock_token):
+        mock_token.return_value = "fake_token"
+        mock_response = MagicMock()
+        mock_response.status_code = 429
+        mock_response.headers = {
+            "X-RateLimit-Limit": "400,4000",
+            "X-RateLimit-Usage": "400,1200",
+            "X-ReadRateLimit-Limit": "200,2000",
+            "X-ReadRateLimit-Usage": "200,700",
+        }
+        mock_response.json.return_value = {"message": "Rate Limit Exceeded"}
+        mock_get.return_value = mock_response
+
+        with pytest.raises(StravaRateLimitError) as exc_info:
+            get_activities(days=30)
+
+        error = exc_info.value
+        assert error.usage == "400,1200"
+        assert error.read_usage == "200,700"
+        assert "Try again after" in str(error)
 
 
 # =============================================================================

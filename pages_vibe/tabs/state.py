@@ -38,6 +38,7 @@ RIDER_DEFAULTS = {
 SESSION_DEFAULTS = {
     'auth_user_id': None,
     'auth_user': None,
+    'guest_mode': False,
     'oauth_state': None,
     'vibe_course': None,
     'vibe_course_id': None,

@@ -171,8 +171,19 @@ class PostgresAuthStore:
         with self._connect() as connection:
             row = connection.execute(
                 """SELECT user_id, strava_athlete_id, username, display_name,
-                          profile_picture_url
-                   FROM users WHERE user_id = %s AND is_active = TRUE""",
+                          profile_picture_url, strava_tokens.scope
+                   FROM users
+                   LEFT JOIN strava_tokens USING (user_id)
+                   WHERE user_id = %s AND is_active = TRUE""",
                 (user_id,),
             ).fetchone()
         return dict(row) if row else None
+
+    def delete_user(self, user_id):
+        """Delete one user and all FK-backed private application data."""
+        with self._connect() as connection:
+            result = connection.execute(
+                "DELETE FROM users WHERE user_id = %s",
+                (user_id,),
+            )
+        return result.rowcount == 1

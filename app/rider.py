@@ -15,6 +15,7 @@ if app_path:
 
 from app.helpers import mps_to_mph  # Assuming this is defined in the helpers module
 from app.strava_calls import *
+from app.auth_store import AUTH_SCHEMA_SQL
 from app.db import connect
 
 
@@ -33,11 +34,10 @@ def _iso(value):
     return value.isoformat() if isinstance(value, dt_datetime) else value
 
 
-# rider_id holds the application user_id; ownership is scoped by that value
-# rather than a DDL foreign key so this store initializes independently.
 RIDER_SCHEMA_SQL = """
 CREATE TABLE IF NOT EXISTS rider_info (
     rider_id TEXT PRIMARY KEY,
+    owner_user_id UUID UNIQUE NOT NULL REFERENCES users(user_id) ON DELETE CASCADE,
     strava_athlete_id TEXT UNIQUE,
     height DOUBLE PRECISION,
     weight DOUBLE PRECISION,
@@ -59,7 +59,7 @@ CREATE TABLE IF NOT EXISTS rider_info (
 );
 
 CREATE TABLE IF NOT EXISTS best_efforts (
-    rider_id TEXT,
+    rider_id TEXT REFERENCES rider_info(rider_id) ON DELETE CASCADE,
     duration INTEGER,
     power DOUBLE PRECISION,
     created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
@@ -69,6 +69,47 @@ CREATE TABLE IF NOT EXISTS best_efforts (
 );
 
 CREATE INDEX IF NOT EXISTS idx_best_efforts_rider ON best_efforts(rider_id);
+
+ALTER TABLE rider_info
+    ADD COLUMN IF NOT EXISTS owner_user_id UUID;
+
+UPDATE rider_info AS rider
+SET owner_user_id = users.user_id
+FROM users
+WHERE rider.owner_user_id IS NULL
+  AND rider.strava_athlete_id ~ '^[0-9]+$'
+  AND users.strava_athlete_id = rider.strava_athlete_id::BIGINT;
+
+CREATE UNIQUE INDEX IF NOT EXISTS idx_rider_info_owner
+    ON rider_info(owner_user_id);
+
+DO $$
+BEGIN
+    IF NOT EXISTS (
+        SELECT 1 FROM pg_constraint
+        WHERE conname = 'rider_info_owner_user_id_fkey'
+    ) THEN
+        ALTER TABLE rider_info
+            ADD CONSTRAINT rider_info_owner_user_id_fkey
+            FOREIGN KEY (owner_user_id) REFERENCES users(user_id)
+            ON DELETE CASCADE NOT VALID;
+    END IF;
+    IF NOT EXISTS (
+        SELECT 1 FROM pg_constraint
+        WHERE conname = 'best_efforts_rider_id_fkey'
+    ) THEN
+        ALTER TABLE best_efforts
+            ADD CONSTRAINT best_efforts_rider_id_fkey
+            FOREIGN KEY (rider_id) REFERENCES rider_info(rider_id)
+            ON DELETE CASCADE NOT VALID;
+    END IF;
+    IF NOT EXISTS (
+        SELECT 1 FROM rider_info WHERE owner_user_id IS NULL
+    ) THEN
+        ALTER TABLE rider_info
+            ALTER COLUMN owner_user_id SET NOT NULL;
+    END IF;
+END $$;
 """
 
 
@@ -102,26 +143,22 @@ def fit_power_profile(best_efforts):
 def initialize_rider_database():
     """Ensure the rider tables exist (PostgreSQL)."""
     with connect() as conn:
+        conn.execute(AUTH_SCHEMA_SQL)
         conn.execute(RIDER_SCHEMA_SQL)
 
 
-def get_cached_strava_rider(rider_id=None):
+def get_cached_strava_rider(user_id):
     """Return cached Strava identity, provenance, and best efforts."""
+    if not user_id:
+        raise ValueError(
+            'An authenticated application user is required to load rider data.')
     initialize_rider_database()
     with connect() as conn:
-        if rider_id:
-            row = conn.execute(
-                '''SELECT * FROM rider_info
-                   WHERE rider_id = %s AND strava_athlete_id IS NOT NULL''',
-                (str(rider_id),),
-            ).fetchone()
-        else:
-            row = conn.execute(
-                '''SELECT * FROM rider_info
-                   WHERE strava_athlete_id IS NOT NULL
-                   ORDER BY COALESCE(strava_last_synced_at, updated_at) DESC
-                   LIMIT 1'''
-            ).fetchone()
+        row = conn.execute(
+            '''SELECT * FROM rider_info
+               WHERE owner_user_id = %s AND strava_athlete_id IS NOT NULL''',
+            (user_id,),
+        ).fetchone()
         if row is None:
             return None
 
@@ -141,8 +178,11 @@ def get_cached_strava_rider(rider_id=None):
     return profile
 
 
-def save_strava_profile(profile):
+def save_strava_profile(profile, user_id):
     """Upsert authenticated athlete identity without refreshing power data."""
+    if not user_id:
+        raise ValueError(
+            'An authenticated application user is required to save rider data.')
     athlete_id = profile.get('id') if profile else None
     if not athlete_id:
         raise ValueError('Strava athlete profile did not include an ID.')
@@ -156,11 +196,12 @@ def save_strava_profile(profile):
     with connect() as conn:
         conn.execute(
             '''INSERT INTO rider_info (
-                   rider_id, strava_athlete_id, athlete_first_name,
+                   rider_id, owner_user_id, strava_athlete_id, athlete_first_name,
                    athlete_last_name, athlete_profile_url, strava_weight,
                    strava_profile_checked_at, strava_profile_json, updated_at
-               ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, NOW())
+               ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, NOW())
                ON CONFLICT(rider_id) DO UPDATE SET
+                   owner_user_id = EXCLUDED.owner_user_id,
                    strava_athlete_id = EXCLUDED.strava_athlete_id,
                    athlete_first_name = EXCLUDED.athlete_first_name,
                    athlete_last_name = EXCLUDED.athlete_last_name,
@@ -170,43 +211,45 @@ def save_strava_profile(profile):
                    strava_profile_json = EXCLUDED.strava_profile_json,
                    updated_at = NOW()''',
             (
-                str(athlete_id), str(athlete_id), profile.get('firstname'),
+                str(user_id), user_id, str(athlete_id), profile.get('firstname'),
                 profile.get('lastname'), profile_url, profile_weight, checked_at,
                 json.dumps(profile),
             ),
         )
-    return get_cached_strava_rider(str(athlete_id))
+    return get_cached_strava_rider(user_id)
 
-def get_all_riders():
-    """Get information about all riders in the database."""
-    try:
-        initialize_rider_database()
-        with connect() as conn:
-            rows = conn.execute(
-                '''SELECT rider_id, strava_athlete_id, height, weight, bike_type,
-                          position, critical_power, "WTank", created_at, updated_at
-                   FROM rider_info ORDER BY updated_at DESC'''
-            ).fetchall()
+def get_all_riders(user_id):
+    """Return the rider owned by one authenticated application user."""
+    if not user_id:
+        raise ValueError(
+            'An authenticated application user is required to list rider data.')
+    initialize_rider_database()
+    with connect() as conn:
+        rows = conn.execute(
+            '''SELECT rider_id, strava_athlete_id, height, weight, bike_type,
+                      position, critical_power, "WTank", created_at, updated_at
+               FROM rider_info
+               WHERE owner_user_id = %s
+               ORDER BY updated_at DESC''',
+            (user_id,),
+        ).fetchall()
 
-        riders = []
-        for row in rows:
-            rider_dict = {
-                'rider_id': row['rider_id'],
-                'strava_athlete_id': row['strava_athlete_id'],
-                'height': row['height'],
-                'weight': row['weight'],
-                'bike_type': row['bike_type'],
-                'position': row['position'],
-                'critical_power': row['critical_power'],
-                'WTank': row['WTank'],
-                'created_at': _iso(row['created_at']),
-                'updated_at': _iso(row['updated_at']),
-            }
-            riders.append(rider_dict)
-        return riders
-    except Exception as e:
-        print(f"Database error: {e}")
-        return []
+    riders = []
+    for row in rows:
+        rider_dict = {
+            'rider_id': row['rider_id'],
+            'strava_athlete_id': row['strava_athlete_id'],
+            'height': row['height'],
+            'weight': row['weight'],
+            'bike_type': row['bike_type'],
+            'position': row['position'],
+            'critical_power': row['critical_power'],
+            'WTank': row['WTank'],
+            'created_at': _iso(row['created_at']),
+            'updated_at': _iso(row['updated_at']),
+        }
+        riders.append(rider_dict)
+    return riders
 
 class Rider:
     """
@@ -316,22 +359,23 @@ class Rider:
         # ============================================================
         # METHOD C: Database lookup or Strava API
         # ============================================================
-        # First, try to get rider_id from Strava if not provided
-        if not self.rider_id:
+        if not self.auth_user_id:
+            print("No authenticated application user is available.")
+            print("Tip: Provide rider_type + critical_power, or best_efforts dict")
+            return
+        self.rider_id = str(self.auth_user_id)
+
+        if not self.strava_athlete_id:
             try:
                 self._apply_strava_profile(get_athlete_profile(
                     user_id=self.auth_user_id))
-                self.rider_id = str(self.strava_athlete_id)
-                print(f"Got Strava athlete ID: {self.rider_id}")
             except Exception as e:
                 print(f"No Strava authentication available: {e}")
                 print("Tip: Provide rider_type + critical_power, or best_efforts dict")
                 return  # Can't proceed without identification
         
         # Check if we have cached data in the database
-        existing_rider_ids = self.get_existing_rider_ids()
-        
-        if self.rider_id in existing_rider_ids and not force_strava_refresh:
+        if self.rider_exists() and not force_strava_refresh:
             # Try to load from database
             if self.load_rider_info_from_db():
                 print(f"Method C: Loaded cached rider data for ID: {self.rider_id}")
@@ -356,9 +400,6 @@ class Rider:
             if not self.athlete_profile:
                 self._apply_strava_profile(get_athlete_profile(
                     user_id=self.auth_user_id))
-            if not self.rider_id:
-                self.rider_id = str(self.strava_athlete_id)
-            
             self.best_efforts = self.get_best_power_from_strava(days)
             self.best_efforts = {
                 duration: power for duration, power in self.best_efforts.items()
@@ -447,8 +488,9 @@ class Rider:
 
     def save_best_efforts_to_db(self):
         """Save best efforts to a database."""
-        if not hasattr(self, 'rider_id') or not self.rider_id:
-            raise ValueError("Rider ID must be provided to save best efforts to the database.")
+        if not self.auth_user_id or self.rider_id != str(self.auth_user_id):
+            raise ValueError(
+                "Authenticated application user ownership is required to save rider data.")
 
         initialize_rider_database()
         synced_at = _to_dt(self.strava_last_synced_at)
@@ -472,15 +514,16 @@ class Rider:
             strava_id = getattr(self, 'strava_athlete_id', None)
             conn.execute(
                 '''INSERT INTO rider_info (
-                       rider_id, strava_athlete_id, height, weight, bike_type,
+                       rider_id, owner_user_id, strava_athlete_id, height, weight, bike_type,
                        position, "CdA", critical_power, "WTank", athlete_first_name,
                        athlete_last_name, athlete_profile_url, strava_weight,
                        strava_profile_checked_at, strava_last_synced_at,
                        strava_lookback_days,
                        strava_profile_json, updated_at
-                   ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s,
+                   ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s,
                              NOW())
                    ON CONFLICT(rider_id) DO UPDATE SET
+                       owner_user_id = EXCLUDED.owner_user_id,
                        strava_athlete_id = EXCLUDED.strava_athlete_id,
                        height = EXCLUDED.height,
                        weight = EXCLUDED.weight,
@@ -499,7 +542,7 @@ class Rider:
                        strava_profile_json = EXCLUDED.strava_profile_json,
                        updated_at = NOW()''',
                 (
-                    self.rider_id, strava_id, self.height, self.weight,
+                    self.rider_id, self.auth_user_id, strava_id, self.height, self.weight,
                     self.bike_type, self.position, self.CdA,
                     self.critical_power, self.WTank, self.athlete_first_name,
                     self.athlete_last_name, self.athlete_profile_url,
@@ -512,8 +555,9 @@ class Rider:
 
     def load_best_efforts_from_db(self):
         """Load best efforts from a database."""
-        if not hasattr(self, 'rider_id') or not self.rider_id:
-            raise ValueError("Rider ID must be provided to load best efforts from the database.")
+        if not self.auth_user_id or self.rider_id != str(self.auth_user_id):
+            raise ValueError(
+                "Authenticated application user ownership is required to load rider data.")
 
         with connect() as conn:
             rows = conn.execute(
@@ -525,8 +569,9 @@ class Rider:
 
     def load_rider_info_from_db(self):
         """Load rider information from the database."""
-        if not hasattr(self, 'rider_id') or not self.rider_id:
-            raise ValueError("Rider ID must be provided to load rider info from the database.")
+        if not self.auth_user_id or self.rider_id != str(self.auth_user_id):
+            raise ValueError(
+                "Authenticated application user ownership is required to load rider data.")
 
         initialize_rider_database()
         with connect() as conn:
@@ -538,8 +583,9 @@ class Rider:
                           strava_profile_checked_at, strava_last_synced_at,
                           strava_lookback_days,
                           strava_profile_json
-                   FROM rider_info WHERE rider_id = %s''',
-                (self.rider_id,),
+                   FROM rider_info
+                   WHERE rider_id = %s AND owner_user_id = %s''',
+                (self.rider_id, self.auth_user_id),
             ).fetchone()
 
         if row:
@@ -563,15 +609,18 @@ class Rider:
             return True
         return False
 
-    def get_existing_rider_ids(self):
-        """Get all existing rider IDs from the database."""
-        try:
-            initialize_rider_database()
-            with connect() as conn:
-                rows = conn.execute('SELECT rider_id FROM rider_info').fetchall()
-            return [row['rider_id'] for row in rows]
-        except Exception:
-            return []
+    def rider_exists(self):
+        """Return whether this authenticated user has a cached rider."""
+        if not self.auth_user_id or self.rider_id != str(self.auth_user_id):
+            return False
+        initialize_rider_database()
+        with connect() as conn:
+            row = conn.execute(
+                '''SELECT 1 FROM rider_info
+                   WHERE rider_id = %s AND owner_user_id = %s''',
+                (self.rider_id, self.auth_user_id),
+            ).fetchone()
+        return row is not None
 
     @staticmethod
     def create_rider_id_from_strava():

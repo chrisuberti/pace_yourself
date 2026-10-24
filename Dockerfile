@@ -25,5 +25,8 @@ USER appuser
 # Expose the port Streamlit uses locally; Render injects $PORT
 EXPOSE 8501
 
+HEALTHCHECK --interval=30s --timeout=5s --start-period=20s --retries=3 \
+    CMD python -c "import os, urllib.request; urllib.request.urlopen(f'http://127.0.0.1:{os.getenv(\"PORT\", \"8501\")}/_stcore/health', timeout=3)"
+
 # Bind to $PORT when provided (Render), default 8501 locally
-CMD ["sh", "-c", "streamlit run main.py --server.port=${PORT:-8501} --server.address=0.0.0.0"]
+CMD ["sh", "-c", "python -m streamlit run main.py --server.port=${PORT:-8501} --server.address=0.0.0.0 --server.headless=true --browser.gatherUsageStats=false"]

@@ -1,7 +1,7 @@
 numpy
 pandas>=2.3,<3
 matplotlib
-plotly
+plotly>=5.24,<8
 pydeck
 requests
 scipy

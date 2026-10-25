@@ -1718,7 +1718,7 @@ class Course:
         
         # Add base route line first (gray, thin) to show full course path
         fig.add_trace(
-            go.Scattermapbox(
+            go.Scattermap(
                 lat=df_sorted['lat'],
                 lon=df_sorted['lon'],
                 mode='lines',
@@ -1773,7 +1773,7 @@ class Course:
                 for run_idx, run in enumerate(runs):
                     run_data = df_sorted.loc[run]
                     fig.add_trace(
-                        go.Scattermapbox(
+                        go.Scattermap(
                             lat=run_data['lat'],
                             lon=run_data['lon'],
                             mode='lines+markers',
@@ -1794,7 +1794,7 @@ class Course:
             else:
                 # For non-contiguous segments (clustering), use markers only
                 fig.add_trace(
-                    go.Scattermapbox(
+                    go.Scattermap(
                         lat=seg_data['lat'],
                         lon=seg_data['lon'],
                         mode='markers',
@@ -1835,7 +1835,7 @@ class Course:
         fig.update_layout(
             title=dict(text=title, x=0.5, xanchor='center'),
             height=height,
-            mapbox=dict(
+            map=dict(
                 style='open-street-map',
                 center=dict(lat=center_lat, lon=center_lon),
                 zoom=zoom
@@ -1889,7 +1889,7 @@ class Course:
         fig = make_subplots(
             rows=1, cols=2,
             column_widths=[0.5, 0.5],
-            specs=[[{"type": "scattermapbox"}, {"type": "xy"}]],
+            specs=[[{"type": "map"}, {"type": "xy"}]],
             horizontal_spacing=0.05
         )
         
@@ -1919,7 +1919,7 @@ class Course:
             
             # Map trace
             fig.add_trace(
-                go.Scattermapbox(
+                go.Scattermap(
                     lat=seg_data['lat'],
                     lon=seg_data['lon'],
                     mode='lines+markers',
@@ -1987,7 +1987,7 @@ class Course:
         fig.update_layout(
             title=dict(text=title, x=0.5, xanchor='center'),
             height=height,
-            mapbox=dict(
+            map=dict(
                 style='open-street-map',
                 center=dict(lat=center_lat, lon=center_lon),
                 zoom=zoom

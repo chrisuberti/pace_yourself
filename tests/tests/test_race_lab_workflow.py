@@ -9,12 +9,14 @@ import pandas as pd
 import pytest
 
 from pages_vibe.tabs import (
+    _charts,
     _workflow,
     tab_course,
     tab_optimization,
     tab_segmentation,
 )
 from pages_vibe.tabs.state import RIDER_DEFAULTS, SESSION_DEFAULTS
+from app.course import Course
 from app.starter_courses import STARTER_COURSES, build_starter_course_frame
 
 
@@ -99,6 +101,24 @@ def test_starter_courses_build_without_authenticated_strava_data():
         )
         distance_m = np.hypot(delta_lat_m, delta_lon_m).fillna(0).sum()
         assert distance_m == pytest.approx(starter.distance_m, rel=0.03)
+
+
+def test_real_starter_course_maps_use_supported_map_traces():
+    starter = next(course for course in STARTER_COURSES if not course.is_virtual)
+    course = Course(build_starter_course_frame(starter.slug))
+
+    preview = _charts.build_gps_map(course.df)
+    assert {trace.type for trace in preview.data} == {'scattermap'}
+    assert preview.layout.map.style == 'open-street-map'
+
+    course.df['segment'] = np.arange(len(course.df)) % 3
+    segmentation = course.plot_segmentation_map(method='clustering')
+    assert {trace.type for trace in segmentation.data} == {'scattermap'}
+    assert segmentation.layout.map.style == 'open-street-map'
+
+    combined = course.plot_segmentation_combined(method='clustering')
+    assert {trace.type for trace in combined.data} == {'scatter', 'scattermap'}
+    assert combined.layout.map.style == 'open-street-map'
 
 
 def test_starter_course_load_commits_and_advances(

@@ -16,14 +16,14 @@ from plotly.subplots import make_subplots
 # ── Course tab charts ──────────────────────────────────────────────────────
 
 def build_gps_map(cdf: pd.DataFrame) -> go.Figure:
-    """Plotly Scattermapbox of the raw course GPS trace.
+    """Plotly map of the raw course GPS trace.
 
     Colors points by gradient if available, else plain blue line.
     """
     fig = go.Figure()
 
     if 'gradient' in cdf.columns:
-        fig.add_trace(go.Scattermapbox(
+        fig.add_trace(go.Scattermap(
             lat=cdf['lat'], lon=cdf['lon'],
             mode='markers+lines',
             marker=dict(
@@ -40,7 +40,7 @@ def build_gps_map(cdf: pd.DataFrame) -> go.Figure:
             ),
         ))
     else:
-        fig.add_trace(go.Scattermapbox(
+        fig.add_trace(go.Scattermap(
             lat=cdf['lat'], lon=cdf['lon'],
             mode='lines',
             line=dict(width=3, color='#3498db'),
@@ -54,9 +54,11 @@ def build_gps_map(cdf: pd.DataFrame) -> go.Figure:
     zoom = 15 if max_range < 0.01 else 13 if max_range < 0.05 else 12 if max_range < 0.1 else 10
 
     fig.update_layout(
-        mapbox=dict(style='open-street-map',
-                    center=dict(lat=center_lat, lon=center_lon),
-                    zoom=zoom),
+        map=dict(
+            style='open-street-map',
+            center=dict(lat=center_lat, lon=center_lon),
+            zoom=zoom,
+        ),
         height=380,
         margin=dict(l=0, r=0, t=0, b=0),
         showlegend=False,

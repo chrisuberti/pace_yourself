@@ -21,22 +21,43 @@ from pages_vibe.tabs import _charts, _workflow
 from pages_vibe.tabs.state import get_course
 
 
+OPEN_ELEVATION_LABELS = {
+    "usgs_ned10m": "USGS NED 10 m terrain elevation",
+    "eu_dem25m": "EU-DEM 25 m terrain elevation",
+}
+
+
 # ── Public entry point ──────────────────────────────────────────────────────
 
 def render(db: CourseDatabase | None, database_error: Exception | None = None) -> None:
+    course = get_course()
+    if course is not None:
+        if st.button(
+            "Continue to Segmentation",
+            type="primary",
+            width="stretch",
+        ):
+            _workflow.set_active_step('segment')
+            st.rerun()
+
     authenticated = bool(st.session_state.get('auth_user_id'))
     sources = _course_sources(
         authenticated, database_available=db is not None)
+    committed_source = st.session_state.get('vibe_course_source')
+    if committed_source and committed_source not in sources:
+        sources.append(committed_source)
     col_source, col_loader = st.columns([1, 3])
 
     with col_source:
         source = st.radio(
             "Course source", sources,
+            index=_course_source_index(sources, committed_source),
             horizontal=False, label_visibility="collapsed",
+            key="course_source_selection",
         )
         if not authenticated:
             st.caption(
-                "Connect Strava from the sidebar to fetch a new segment. "
+                "Connect Strava from the page footer to fetch a new segment. "
                 "Shared non-Strava courses remain available without connecting."
             )
 
@@ -77,13 +98,16 @@ def _render_starter_course_loader() -> None:
         for starter in STARTER_COURSES
     }
 
-    with st.form("starter_course_form"):
-        pick = st.selectbox("Starter course", labels, label_visibility="collapsed")
-        load_course = st.form_submit_button(
-            "Load Starter Course",
-            type="primary",
-            width="stretch",
-        )
+    pick = st.selectbox(
+        "Starter course",
+        labels,
+        index=_starter_course_index(
+            labels,
+            st.session_state.get('vibe_course_id'),
+        ),
+        label_visibility="collapsed",
+        key="starter_course_selection",
+    )
 
     starter = get_starter_course(labels[pick])
     st.caption(f"{starter.location} · {starter.description}")
@@ -99,19 +123,21 @@ def _render_starter_course_loader() -> None:
         )
     st.link_button("View segment reference", starter.segment_url)
 
-    if load_course:
-        _load_starter_course(starter.slug)
+    if st.session_state.get('vibe_course_id') != f"starter:{starter.slug}":
+        _load_starter_course(starter.slug, advance=False)
 
 
-def _load_starter_course(slug: str) -> None:
+def _load_starter_course(slug: str, *, advance: bool = True) -> None:
     starter = get_starter_course(slug)
     try:
         course = Course(build_starter_course_frame(slug))
         course.starter_course = starter
-        _commit_course_and_advance(
+        _commit_course(
             course=course,
             course_id=f"starter:{starter.slug}",
             course_name=starter.name,
+            course_source="Starter Courses",
+            advance=advance,
         )
         st.toast(f"Loaded: {starter.name}")
         st.rerun()
@@ -131,6 +157,31 @@ def _course_sources(
     if authenticated:
         sources.append("Strava Segment")
     return sources
+
+
+def _course_source_index(
+    sources: list[str],
+    committed_source: str | None,
+) -> int:
+    """Select the committed source when a hidden workspace is rendered again."""
+    if committed_source in sources:
+        return sources.index(committed_source)
+    return 0
+
+
+def _starter_course_index(
+    labels: dict[str, str],
+    committed_course_id,
+) -> int:
+    """Select the committed starter instead of silently loading the first one."""
+    if not isinstance(committed_course_id, str):
+        return 0
+    prefix = "starter:"
+    if not committed_course_id.startswith(prefix):
+        return 0
+    slug = committed_course_id[len(prefix):]
+    values = list(labels.values())
+    return values.index(slug) if slug in values else 0
 
 
 # ── Database loader ─────────────────────────────────────────────────────────
@@ -165,24 +216,25 @@ def _render_database_loader(db: CourseDatabase) -> None:
     if current_id in labels.values():
         current_index = list(labels.values()).index(current_id)
 
-    with st.form("database_course_form"):
-        pick = st.selectbox(
-            "Select course",
-            list(labels.keys()),
-            index=current_index,
-            label_visibility="collapsed",
-        )
-        load_course = st.form_submit_button(
-            "Load Course",
-            type="primary",
-            width="stretch",
-        )
+    pick = st.selectbox(
+        "Select course",
+        list(labels.keys()),
+        index=current_index,
+        label_visibility="collapsed",
+        key="database_course_selection",
+    )
 
-    if load_course:
-        _load_course_from_db(db, labels[pick], pick)
+    if st.session_state.get('vibe_course_id') != labels[pick]:
+        _load_course_from_db(db, labels[pick], pick, advance=False)
 
 
-def _load_course_from_db(db: CourseDatabase, course_id: str, label: str) -> None:
+def _load_course_from_db(
+    db: CourseDatabase,
+    course_id: str,
+    label: str,
+    *,
+    advance: bool = True,
+) -> None:
     cdata = db.get_course(
         course_id, user_id=st.session_state.get('auth_user_id'))
     if not cdata:
@@ -203,10 +255,12 @@ def _load_course_from_db(db: CourseDatabase, course_id: str, label: str) -> None
             st.error("No GPS data available for this course.")
             return
 
-        _commit_course_and_advance(
+        _commit_course(
             course=course,
             course_id=course_id,
             course_name=cdata.get('course_name', label),
+            course_source="Database",
+            advance=advance,
         )
         st.rerun()
     except Exception as e:
@@ -242,8 +296,13 @@ def _render_csv_upload() -> None:
             with st.spinner("Processing CSV…"):
                 df = pd.read_csv(uploaded)
                 course = Course(df)
-                _commit_course_and_advance(
-                    course=course, course_id=None, course_name=csv_name)
+                _commit_course(
+                    course=course,
+                    course_id=None,
+                    course_name=csv_name,
+                    course_source="Upload CSV",
+                    advance=False,
+                )
             st.toast(f"Loaded: {csv_name}")
             st.rerun()
         except Exception as e:
@@ -315,8 +374,13 @@ def _render_strava_fetch() -> None:
             course_id = _persist_strava_segment(
                 seg_id_input, seg_name, raw_gps, auth_user_id)
 
-            _commit_course_and_advance(
-                course=course, course_id=course_id, course_name=seg_name)
+            _commit_course(
+                course=course,
+                course_id=course_id,
+                course_name=seg_name,
+                course_source="Strava Segment",
+                advance=False,
+            )
             st.session_state['_last_strava_seg_id'] = str(seg_id_input).strip()
 
         st.toast(f"Fetched & saved: {seg_name}")
@@ -325,16 +389,35 @@ def _render_strava_fetch() -> None:
         render_strava_failure(e, "Strava segment fetch")
 
 
-def _commit_course_and_advance(course: Course, course_id: str | None,
-                               course_name: str) -> None:
-    """Commit a successfully loaded course and open segmentation."""
+def _commit_course(
+    course: Course,
+    course_id: str | None,
+    course_name: str,
+    *,
+    course_source: str | None = None,
+    advance: bool,
+) -> None:
+    """Commit a successfully loaded course and optionally open segmentation."""
     _workflow.mark_course_loaded(
         course=course,
         course_id=course_id,
         course_name=course_name,
+        course_source=course_source,
     )
-    if not _workflow.set_active_step('segment'):
+    if advance and not _workflow.set_active_step('segment'):
         raise RuntimeError("Loaded course did not unlock segmentation.")
+
+
+def _commit_course_and_advance(course: Course, course_id: str | None,
+                               course_name: str) -> None:
+    """Compatibility wrapper for callers that confirm and advance."""
+    _commit_course(
+        course,
+        course_id,
+        course_name,
+        course_source=None,
+        advance=True,
+    )
 
 
 def _persist_strava_segment(
@@ -362,11 +445,18 @@ def _render_course_overview(course: Course) -> None:
     starter = getattr(course, "starter_course", None)
 
     if starter is not None:
-        source_description = (
-            "Virtual profile and schematic geometry"
-            if starter.is_virtual
-            else "OpenStreetMap GPS geometry with a normalized elevation profile"
-        )
+        if starter.is_virtual:
+            source_description = "Demo data · schematic route and elevation"
+        elif starter.elevation_source in OPEN_ELEVATION_LABELS:
+            source_description = (
+                "OpenStreetMap bicycle-route geometry · "
+                f"{OPEN_ELEVATION_LABELS[starter.elevation_source]}"
+            )
+        else:
+            source_description = (
+                "Demo data · real OpenStreetMap route geometry; elevation is "
+                "normalized from public reference data, not recorded GPS altitude"
+            )
         st.caption(f"{source_description} · {starter.location}")
 
     total_dist_m = (cdf['cumulative_distance'].max()

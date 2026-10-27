@@ -8,7 +8,8 @@ single runtime path.
 ## Runtime Flow
 1. main.py starts the app and routes to Race Lab.
 2. pages_vibe/01_Race_Lab.py initializes session state, authentication, the
-   top workflow navigator, and the persistent setup summary.
+   persistent Strava connection status/action, the top workflow navigator with
+   embedded setup summaries, and the account footer.
 3. Workflow modules handle feature domains:
 - Course source/load and previews
 - Segmentation preview/apply
@@ -73,12 +74,14 @@ single runtime path.
 - `pages_vibe/tabs/_workflow.py` owns workflow transitions and prerequisite checks.
 - `pages_vibe/tabs/_charts.py` contains pure Plotly figure builders with no
 	Streamlit calls.
-- The navigator updates only `vibe_active_step`; it is not a committed analysis
-  transition and renders exactly one workflow module per rerun.
+- The navigator renders exactly one workflow module per rerun. Forward navigation
+  fills only missing local starter-course, segmentation, and rider defaults.
+  Optimize navigation creates a one-shot explicit run request.
 - Course, segmentation, rider, and optimization revisions define whether the
   last successful result is current or stale. Stale results retain their rider
   and course display context until a successful replacement or explicit reset.
-- Network calls and expensive calculations require explicit user actions.
+- Network calls require explicit user actions. Optimization starts only from an
+  explicit Optimize/Re-optimize navigation or workspace action.
 
 ## Persistence
 - PostgreSQL is the runtime store. `app/auth_store.py` owns `users` and

@@ -8,7 +8,11 @@ import streamlit as st
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
 
 from app.database import CourseDatabase
-from pages_vibe.auth_ui import render_authentication
+from pages_vibe.auth_ui import (
+    render_account_footer,
+    render_account_header,
+    render_authentication,
+)
 from pages_vibe.privacy_ui import render_privacy_notice
 from pages_vibe.tabs import (
     _workflow,
@@ -41,107 +45,29 @@ except Exception as error:
 
 
 def _render_header() -> None:
-    st.title("Race Lab")
-    st.caption(
-        "Build a race plan from course selection through a terrain-aware "
-        "pacing strategy."
+    title_col, account_col, action_col = st.columns(
+        [3.4, 1.4, 1],
+        vertical_alignment="bottom",
     )
-
-
-def _render_workflow_tabs() -> None:
-    status_prefix = {
-        'complete': '✓',
-        'current': '●',
-        'available': '○',
-        'blocked': '—',
-    }
-    columns = st.columns(len(WORKFLOW_STEPS), gap="small")
-    for index, (column, (step, label)) in enumerate(
-        zip(columns, WORKFLOW_STEPS),
-        start=1,
-    ):
-        status = _workflow.step_status(step)
-        with column:
-            if st.button(
-                f"{status_prefix[status]}  {index}. {label}",
-                key=f"workflow_nav_{step}",
-                type='primary' if status == 'current' else 'secondary',
-                disabled=status == 'blocked',
-                width='stretch',
-            ):
-                _workflow.set_active_step(step)
-                st.rerun()
-
-
-def _render_setup_strip() -> None:
-    course = get_course()
-    rider = get_rider()
-
-    with st.container(border=True):
-        course_col, segment_col, rider_col, result_col = st.columns(
-            [1.1, 1, 1.35, 1],
-            gap="medium",
+    with title_col:
+        st.title("Race Lab")
+        st.caption(
+            "Build a race plan from course selection through a terrain-aware "
+            "pacing strategy."
         )
-
-        with course_col:
-            st.markdown("**Course**")
-            if course is None:
-                st.caption("Not loaded")
-            else:
-                cdf = course.df
-                distance = (
-                    cdf['cumulative_distance'].max() / 1000
-                    if 'cumulative_distance' in cdf.columns
-                    else 0.0
-                )
-                st.caption(
-                    f"{st.session_state.get('vibe_course_name') or 'Loaded course'}"
-                    f" · {distance:.1f} km"
-                )
-
-        with segment_col:
-            st.markdown("**Segmentation**")
-            segmentation = st.session_state.get('vibe_segmentation_name')
-            st.caption(segmentation if segmentation else "Not applied")
-
-        with rider_col:
-            st.markdown("**Rider & physics**")
-            bike_mass = rider.get(
-                'bike_mass',
-                BIKE_MASS_DEFAULTS.get(rider.get('bike_type', 'Road'), 8.5),
-            )
-            system_mass = rider['weight'] + bike_mass
-            st.caption(
-                f"{rider['critical_power']} W CP · "
-                f"{rider['w_prime'] / 1000:.0f} kJ W' · "
-                f"{system_mass:.1f} kg · "
-                f"CdA {rider['cda']:.3f} · Crr {rider['crr']:.3f}"
-            )
-
-        with result_col:
-            st.markdown("**Result**")
-            status = _workflow.result_status()
-            labels = {
-                'not_run': "Not run",
-                'current': "✓ Current",
-                'stale': "⚠ Inputs changed",
-            }
-            st.caption(labels[status])
+    with account_col:
+        render_account_header()
+    with action_col:
+        _render_new_analysis_action()
 
 
-def _render_sidebar_actions() -> None:
-    st.sidebar.divider()
-    st.sidebar.markdown("### Analysis")
-
+def _render_new_analysis_action() -> None:
     if st.session_state.get('_confirm_new_analysis'):
-        st.sidebar.warning(
-            "Start a new analysis? The active course, segmentation, and saved "
-            "result will be cleared. Your rider profile stays available."
-        )
-        confirm_col, cancel_col = st.sidebar.columns(2)
+        st.warning("Clear this analysis? Your rider profile will be kept.")
+        confirm_col, cancel_col = st.columns(2)
         with confirm_col:
             if st.button(
-                "Confirm",
+                "Clear",
                 key="confirm_new_analysis",
                 type="primary",
                 width="stretch",
@@ -151,15 +77,81 @@ def _render_sidebar_actions() -> None:
                 st.rerun()
         with cancel_col:
             if st.button(
-                "Cancel",
+                "Keep",
                 key="cancel_new_analysis",
                 width="stretch",
             ):
                 st.session_state['_confirm_new_analysis'] = False
                 st.rerun()
-    elif st.sidebar.button("New analysis", width="stretch"):
+    elif st.button("New analysis", width="stretch"):
         st.session_state['_confirm_new_analysis'] = True
         st.rerun()
+
+
+def _render_workflow_tabs() -> None:
+    status_prefix = {
+        'complete': '✓',
+        'current': '●',
+        'available': '○',
+    }
+    columns = st.columns(len(WORKFLOW_STEPS), gap="small")
+    for index, (column, (step, label)) in enumerate(
+        zip(columns, WORKFLOW_STEPS),
+        start=1,
+    ):
+        status = _workflow.step_status(step)
+        with column:
+            summary = _step_summary(step)
+            if st.button(
+                f"{status_prefix[status]} {index}. {label}\n{summary}",
+                key=f"workflow_nav_{step}",
+                type='primary' if status == 'current' else 'secondary',
+                width='stretch',
+            ):
+                try:
+                    _workflow.set_active_step(step)
+                except Exception as error:
+                    st.error(f"Could not prepare {label}: {error}")
+                    return
+                st.rerun()
+
+
+def _step_summary(step: str) -> str:
+    course = get_course()
+    rider = get_rider()
+    if step == 'course':
+        if course is None:
+            return "Uses a starter course by default"
+        cdf = course.df
+        distance = (
+            cdf['cumulative_distance'].max() / 1000
+            if 'cumulative_distance' in cdf.columns
+            else 0.0
+        )
+        return (
+            f"{st.session_state.get('vibe_course_name') or 'Loaded course'}"
+            f" · {distance:.1f} km"
+        )
+    if step == 'segment':
+        return (
+            st.session_state.get('vibe_segmentation_name')
+            or "Uses terrain zones by default"
+        )
+    if step == 'rider':
+        bike_mass = rider.get(
+            'bike_mass',
+            BIKE_MASS_DEFAULTS.get(rider.get('bike_type', 'Road'), 8.5),
+        )
+        return (
+            f"{rider['critical_power']} W CP · "
+            f"{rider['weight'] + bike_mass:.1f} kg system"
+        )
+    labels = {
+        'not_run': "Click to start",
+        'current': "Results ready · click to re-run",
+        'stale': "Inputs changed · click to re-run",
+    }
+    return labels[_workflow.result_status()]
 
 
 def _render_active_workspace() -> None:
@@ -183,6 +175,5 @@ def _render_active_workspace() -> None:
 
 _render_header()
 _render_workflow_tabs()
-_render_setup_strip()
-_render_sidebar_actions()
 _render_active_workspace()
+render_account_footer()

@@ -278,8 +278,9 @@ def build_results_chart(results: dict, rider_config: dict, course_obj) -> go.Fig
                     xanchor='center', x=0.5, font=dict(size=11)),
         hovermode='x unified',
     )
+    power_range = _power_axis_range(results, cp)
     fig.update_yaxes(title_text="Power (W)", row=1, col=1,
-                     secondary_y=False, range=[cp * 0.5, cp * 1.5])
+                     secondary_y=False, range=power_range)
     fig.update_yaxes(title_text="Elevation (m)", row=1, col=1,
                      secondary_y=True, showgrid=False,
                      title_font=dict(color='gray'),
@@ -294,6 +295,29 @@ def build_results_chart(results: dict, rider_config: dict, course_obj) -> go.Fig
 
 
 # ── Optimization sub-builders ───────────────────────────────────────────────
+
+def _power_axis_range(results: dict, critical_power: float) -> list[float]:
+    """Return a padded range containing every plotted power value and CP."""
+    plotted_power = [float(critical_power)]
+    for strategy in ('constant', 'variable'):
+        detailed = results.get(strategy, {}).get('detailed')
+        if detailed is None or 'power' not in detailed:
+            continue
+        values = np.asarray(detailed['power'], dtype=float)
+        plotted_power.extend(values[np.isfinite(values)].tolist())
+
+    minimum = min(plotted_power)
+    maximum = max(plotted_power)
+    span = maximum - minimum
+    padding = max(
+        15.0,
+        span * 0.08,
+        float(critical_power) * 0.05,
+    )
+    if span == 0:
+        padding = max(padding, float(critical_power) * 0.15)
+    return [max(0.0, minimum - padding), maximum + padding]
+
 
 def _add_elevation_traces(fig, course_obj, det, dist_km, altitude):
     """Add terrain-colored or plain elevation fill to panel 1."""

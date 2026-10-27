@@ -21,7 +21,7 @@ Shared:
 ## Rules
 1. **State writes funnel through `_workflow`.** Never assign `vibe_*` keys
    directly from a workflow module. Use:
-   - `_workflow.mark_course_loaded(course, course_id, name)`
+   - `_workflow.mark_course_loaded(course, course_id, name, course_source)`
    - `_workflow.mark_segmentation_applied(course, name, params)`
    - `_workflow.mark_rider_profile(rider, rider_obj=None)`
    - `_workflow.mark_optimization_settings(params)`
@@ -29,10 +29,9 @@ Shared:
    - `_workflow.set_active_step(step)`
    - `_workflow.reset_analysis()`
 2. **Gate at the top of `render`.** Use `_workflow.require_course()` /
-   `require_segmentation()` / `require_results()`; bail early on `False`. The
-   shell uses `can_open_step(step)` to disable blocked forward navigation.
-   Optimize is the exception: a stale saved result remains viewable even while
-   current prerequisites are incomplete.
+   `require_segmentation()` / `require_results()`; bail early on `False`.
+   The shell may prepare local starter-course, segmentation, and rider defaults
+   before opening a forward step. A stale saved result remains viewable.
 3. **Workflow modules export only `render(...)`.** Everything else is `_private`.
 4. **Charts are pure builders.** Functions in `_charts.py` return a
    `plotly.graph_objects.Figure`; they do not call `st.plotly_chart`. The tab
@@ -42,21 +41,25 @@ Shared:
 6. **Do not import from `archive/` or `app/visualizations*.py`** — both are
    reference-only and carry deprecation banners.
 7. **Keep drafts separate from committed state.** Ordinary widget reruns may
-   update local preview values, but API calls, curve fitting, segmentation, and
-   optimization require explicit form/button submission. Do not auto-run work
-   when a step first opens.
+   update local preview values, but API calls and curve fitting require explicit
+   form/button submission. The only navigation-side commits are missing local
+   defaults prepared by `_workflow.set_active_step()`. Optimization may auto-run
+   only from the one-shot request created by explicitly clicking Optimize.
 8. **Render one workspace at a time.** The top workflow navigator owns
    `vibe_active_step`. Do not use native `st.tabs` for the four-step workflow
    because every tab body executes on each rerun.
-9. **Navigation is not a commit.** Top navigation and contextual Continue
-   actions may update only `vibe_active_step`; they must not revise inputs,
-   stale results, or trigger API/compute work.
-   Successful confirmation actions advance to the next step: loading a course
-   opens Segment, applying segmentation opens Rider, and rider confirmation
-   opens Optimize. Failed actions remain on the current step with their error.
+9. **Navigation is default-aware.** Every workflow step is reachable. Forward
+   navigation fills only missing upstream local defaults and never calls an API.
+   Clicking Optimize also creates a one-shot run request; merely rerunning or
+   reopening the page does not. Failed preparation remains on the current step
+   with an explicit error.
 10. **Preserve the last valid result.** Committed upstream changes mark results
     stale. Only a successful optimization replaces them, and only
     `reset_analysis()` intentionally clears the active analysis.
+11. **Recreated widgets derive from committed state.** Streamlit removes widget
+    keys when their workspace is hidden. Source selectors and dropdown indices
+    must be rebuilt from canonical `vibe_*` values so revisiting a completed
+    step cannot auto-commit its first option and invalidate downstream work.
 
 ## When to extract
 - A chart helper used in more than one tab → move to `_charts.py`.
@@ -68,5 +71,5 @@ Shared:
 ## Run / smoke test
 - `.venv/bin/python -m streamlit run main.py`
 - Walk Course -> Segment -> Rider -> Optimize using the top navigator or contextual
-   Continue actions. Confirm each step stays idle until its explicit primary
-   action is submitted, and that only the active workspace renders.
+   Continue actions. Confirm missing defaults are prepared, Optimize runs once
+   per click, API calls remain explicit, and only the active workspace renders.

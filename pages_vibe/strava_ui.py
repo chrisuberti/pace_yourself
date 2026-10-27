@@ -24,7 +24,7 @@ def render_strava_failure(error: Exception, action: str) -> None:
             (StravaScopeError, InsufficientScope, AuthenticationRequired)):
         st.error(f"{action} needs renewed Strava access: {error}")
         st.info(
-            "Use **Reconnect with Strava** in the sidebar and approve the "
+            "Use **Reconnect with Strava** in the page footer and approve the "
             "requested scopes.")
     elif isinstance(error, StravaAPIError):
         st.error(f"{action} failed: {error}")

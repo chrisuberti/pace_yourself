@@ -33,6 +33,12 @@ def render() -> None:
     results = get_results()
     course: Course | None = get_course()
 
+    if _workflow.consume_optimize_request():
+        if not _workflow.require_segmentation():
+            return
+        _run_compare(course, get_rider())
+        return
+
     if results is None:
         if not _workflow.require_segmentation():
             return
@@ -48,8 +54,6 @@ def render() -> None:
             f"**Inputs changed.** These results use the previous {reasons}. "
             "They remain available until a new optimization succeeds."
         )
-    else:
-        st.success("Results match the current committed inputs.")
 
     if _workflow.can_run_optimization():
         _render_controls(course, get_rider(), has_results=True)

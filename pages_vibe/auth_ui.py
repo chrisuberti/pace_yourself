@@ -19,7 +19,7 @@ from app.auth import (
 )
 from pages_vibe.privacy_ui import (
     render_oauth_consent_summary,
-    render_privacy_sidebar,
+    render_privacy_footer,
 )
 from pages_vibe.tabs import _workflow
 from pages_vibe.tabs.state import RIDER_DEFAULTS
@@ -31,12 +31,8 @@ STRAVA_CONNECT_ASSET = (
 
 def render_authentication() -> None:
     """Bind a Strava user or allow an isolated guest workflow."""
-    render_privacy_sidebar()
     if not authentication_configured():
         st.session_state.guest_mode = True
-        st.sidebar.caption(
-            'Guest mode · Shared courses, CSV uploads, and manual rider setup '
-            'are available. Strava login is not configured.')
         return
 
     code = st.query_params.get('code')
@@ -70,19 +66,11 @@ def render_authentication() -> None:
             st.session_state.auth_user = user
             st.session_state.guest_mode = False
             _bind_user_to_rider(user)
-            _render_scope_warning(user)
-            st.sidebar.caption(f"Connected as {user['display_name']}")
-            if st.sidebar.button('Log out', width='stretch'):
-                st.session_state.clear()
-                st.query_params.clear()
-                st.rerun()
-            _render_disconnect_controls(user_id)
             return
         st.session_state.auth_user_id = None
         st.session_state.auth_user = None
 
     if st.session_state.get('guest_mode'):
-        _render_guest_sidebar()
         return
 
     disconnect_status = st.query_params.get('disconnected')
@@ -118,29 +106,86 @@ def render_authentication() -> None:
     st.stop()
 
 
-def _render_guest_sidebar() -> None:
-    """Show guest status and an optional upgrade path to Strava."""
-    st.sidebar.caption(
-        'Guest mode · Shared courses and manual rider setup are available.')
+def render_account_footer() -> None:
+    """Render privacy and account controls at the bottom of Race Lab."""
+    st.divider()
+    info_col, account_col = st.columns([2, 1], vertical_alignment="top")
+
+    with info_col:
+        st.caption(
+            "Pace Yourself · Strava connection is optional. Imported athlete "
+            "data, private courses, and results stay tied to your account."
+        )
+        render_privacy_footer()
+
+    with account_col:
+        if not authentication_configured():
+            st.caption(
+                "Guest mode · Strava login is not configured for this deployment."
+            )
+            return
+
+        user = st.session_state.get('auth_user')
+        user_id = st.session_state.get('auth_user_id')
+        if user and user_id:
+            _render_scope_warning(user)
+            if st.button('Log out', width='stretch'):
+                st.session_state.clear()
+                st.query_params.clear()
+                st.rerun()
+            _render_disconnect_controls(user_id)
+            return
+
+        st.caption(
+            "Guest mode · Connect Strava from the top of the page to fetch "
+            "segments and import rider data."
+        )
+
+
+def render_account_header() -> None:
+    """Keep Strava connection state and its primary action above the workflow."""
+    status = _account_header_status(
+        configured=authentication_configured(),
+        user=st.session_state.get('auth_user'),
+        user_id=st.session_state.get('auth_user_id'),
+    )
+    if status == 'unavailable':
+        st.caption("○ Guest mode · Strava login unavailable")
+        return
+
+    user = st.session_state.get('auth_user')
+    if status == 'connected':
+        st.markdown("🟢 **Strava connected**")
+        st.caption(user['display_name'])
+        return
+
+    st.caption("○ Strava not connected")
     if not st.session_state.get('oauth_state'):
         st.session_state.oauth_state = create_oauth_state()
-    with st.sidebar:
-        _render_connect_with_strava(
-            get_authorization_url(st.session_state.oauth_state))
+    _render_connect_with_strava(
+        get_authorization_url(st.session_state.oauth_state))
+
+
+def _account_header_status(*, configured: bool, user, user_id) -> str:
+    """Return unavailable, connected, or disconnected for header rendering."""
+    if not configured:
+        return 'unavailable'
+    if user and user_id:
+        return 'connected'
+    return 'disconnected'
 
 
 def _render_scope_warning(user) -> None:
     missing = missing_required_scopes(user.get('scope'))
     if not missing:
         return
-    st.sidebar.warning(
+    st.warning(
         'Strava access is incomplete. Reconnect and approve: '
         + ', '.join(sorted(missing)))
     if not st.session_state.get('oauth_state'):
         st.session_state.oauth_state = create_oauth_state()
-    with st.sidebar:
-        _render_connect_with_strava(
-            get_authorization_url(st.session_state.oauth_state))
+    _render_connect_with_strava(
+        get_authorization_url(st.session_state.oauth_state))
 
 
 def _render_connect_with_strava(authorization_url: str) -> None:
@@ -158,7 +203,7 @@ def _render_connect_with_strava(authorization_url: str) -> None:
 
 
 def _render_disconnect_controls(user_id: str) -> None:
-    with st.sidebar.expander('Disconnect Strava and delete my data'):
+    with st.expander('Disconnect Strava and delete my data'):
         st.warning(
             'This permanently deletes your tokens, rider cache, private Strava '
             'courses, and private optimization results.')

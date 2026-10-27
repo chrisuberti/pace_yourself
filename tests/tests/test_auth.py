@@ -8,7 +8,7 @@ from app import auth
 from app.auth_store import AUTH_SCHEMA_SQL
 from app.database import SCHEMA_SQL
 from app.rider import RIDER_SCHEMA_SQL
-from pages_vibe.auth_ui import _rider_for_user
+from pages_vibe.auth_ui import _account_header_status, _rider_for_user
 from pages_vibe.tabs import tab_rider
 from pages_vibe.tabs.tab_course import _course_sources
 from pages_vibe.tabs.tab_rider import _power_source_options
@@ -220,6 +220,27 @@ def test_guest_mode_excludes_strava_only_actions():
         'Starter Courses', 'Database', 'Upload CSV']
     assert _power_source_options(authenticated=False) == [
         'Rider Type', 'Manual Entry']
+
+
+@pytest.mark.parametrize(
+    ('configured', 'user', 'user_id', 'expected'),
+    [
+        (False, None, None, 'unavailable'),
+        (True, None, None, 'disconnected'),
+        (True, {'display_name': 'Ada'}, 'user-1', 'connected'),
+    ],
+)
+def test_account_header_status_is_unambiguous(
+    configured,
+    user,
+    user_id,
+    expected,
+):
+    assert _account_header_status(
+        configured=configured,
+        user=user,
+        user_id=user_id,
+    ) == expected
 
 
 def test_database_outage_preserves_csv_guest_path():

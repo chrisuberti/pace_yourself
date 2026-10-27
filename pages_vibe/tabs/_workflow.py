@@ -32,6 +32,12 @@ RIDER_OPTIMIZATION_KEYS = (
     'crr',
 )
 
+DEFAULT_SEGMENTATION = {
+    'flat_threshold': 2.0,
+    'steep_threshold': 6.0,
+    'min_segment_distance': 200,
+}
+
 
 def current_input_signature() -> dict[str, int | None]:
     """Return the revisions that define the currently committed analysis."""
@@ -95,16 +101,8 @@ def can_run_optimization() -> bool:
 
 
 def can_open_step(step: str) -> bool:
-    """Return whether the step's true workflow prerequisites are satisfied."""
-    if step == 'course':
-        return True
-    if step == 'segment':
-        return get_course() is not None
-    if step == 'rider':
-        return bool(st.session_state.get('vibe_segmentation_applied'))
-    if step == 'optimize':
-        return get_results() is not None or can_run_optimization()
-    return False
+    """Return whether the navigator can prepare and open a workflow step."""
+    return step in {key for key, _ in WORKFLOW_STEPS}
 
 
 def step_status(step: str) -> str:
@@ -112,8 +110,6 @@ def step_status(step: str) -> str:
     active = st.session_state.get('vibe_active_step', 'course')
     if step == active:
         return 'current'
-    if not can_open_step(step):
-        return 'blocked'
     complete = {
         'course': get_course() is not None,
         'segment': bool(st.session_state.get('vibe_segmentation_applied')),
@@ -126,12 +122,57 @@ def step_status(step: str) -> str:
 
 
 def set_active_step(step: str) -> bool:
-    """Navigate to an available workflow step."""
+    """Prepare missing defaults and navigate to any workflow step."""
     valid_steps = {key for key, _ in WORKFLOW_STEPS}
-    if step not in valid_steps or not can_open_step(step):
+    if step not in valid_steps:
         return False
+    _ensure_step_defaults(step)
     st.session_state.vibe_active_step = step
+    if step == 'optimize':
+        st.session_state.vibe_optimize_requested = True
     return True
+
+
+def consume_optimize_request() -> bool:
+    """Consume the one-shot optimization request created by navigation."""
+    requested = bool(st.session_state.get('vibe_optimize_requested'))
+    st.session_state.vibe_optimize_requested = False
+    return requested
+
+
+def _ensure_step_defaults(step: str) -> None:
+    """Fill only missing upstream inputs needed to open ``step``."""
+    step_keys = [key for key, _ in WORKFLOW_STEPS]
+    target_index = step_keys.index(step)
+    if target_index >= step_keys.index('segment') and get_course() is None:
+        from app.course import Course
+        from app.starter_courses import (
+            STARTER_COURSES,
+            build_starter_course_frame,
+        )
+
+        starter = STARTER_COURSES[0]
+        course = Course(build_starter_course_frame(starter.slug))
+        course.starter_course = starter
+        mark_course_loaded(
+            course,
+            course_id=f'starter:{starter.slug}',
+            course_name=starter.name,
+            course_source='Starter Courses',
+        )
+
+    if (
+        target_index >= step_keys.index('rider')
+        and not st.session_state.get('vibe_segmentation_applied')
+    ):
+        course = get_course()
+        course.gradient_band_segmentation(**DEFAULT_SEGMENTATION)
+        course.enable_enhanced_segmentation()
+        mark_segmentation_applied(
+            course,
+            name='Terrain',
+            params=DEFAULT_SEGMENTATION,
+        )
 
 
 # ── Gating helpers (return True if prerequisite satisfied) ──────────────────
@@ -174,11 +215,17 @@ def require_results(
 
 # ── State write helpers (single funnel for workflow transitions) ────────────
 
-def mark_course_loaded(course, course_id, course_name: str) -> None:
+def mark_course_loaded(
+    course,
+    course_id,
+    course_name: str,
+    course_source: str | None = None,
+) -> None:
     """Persist a freshly-loaded course and invalidate current segmentation."""
     st.session_state.vibe_course = course
     st.session_state.vibe_course_id = course_id
     st.session_state.vibe_course_name = course_name
+    st.session_state.vibe_course_source = course_source
     _bump_revision('course')
     _reset_after_course()
 
@@ -284,6 +331,7 @@ def reset_analysis() -> None:
         'vibe_course': None,
         'vibe_course_id': None,
         'vibe_course_name': None,
+        'vibe_course_source': None,
         'vibe_segmentation_applied': False,
         'vibe_segmentation_name': None,
         'vibe_segmentation_params': None,
@@ -293,6 +341,7 @@ def reset_analysis() -> None:
         'vibe_results_rider': None,
         'vibe_results_course_df': None,
         'vibe_active_step': 'course',
+        'vibe_optimize_requested': False,
     })
     _bump_revision('course')
     _bump_revision('segmentation')

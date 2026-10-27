@@ -50,22 +50,14 @@ private Strava data.
     st.link_button("Return to Race Lab", "?", width="stretch")
 
 
-def render_privacy_sidebar() -> None:
-    """Keep privacy and support links visible throughout the app."""
-    with st.sidebar.expander("Privacy, consent & support"):
-        st.markdown(
-            """
-Strava connection is optional. Imported athlete data, Strava courses, and
-results are private to the connected user.
+def render_privacy_footer() -> None:
+    """Render compact privacy and support links in the page footer."""
+    st.markdown(
+        f"""
+[Privacy & data use](?view=privacy) · [Support]({_support_url()}) ·
+[Connected apps on Strava](https://www.strava.com/settings/apps)
 """
-        )
-        st.markdown(
-            f"""
-- [Privacy & data use](?view=privacy)
-- [Support]({_support_url()})
-- [Connected apps on Strava](https://www.strava.com/settings/apps)
-"""
-        )
+    )
 
 
 def render_oauth_consent_summary() -> None:

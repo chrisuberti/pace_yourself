@@ -43,6 +43,7 @@ SESSION_DEFAULTS = {
     'vibe_course': None,
     'vibe_course_id': None,
     'vibe_course_name': None,
+    'vibe_course_source': None,
     'vibe_segmentation_applied': False,
     'vibe_segmentation_name': None,
     'vibe_segmentation_params': None,
@@ -60,6 +61,7 @@ SESSION_DEFAULTS = {
     'vibe_pending_rider_weight': None,
     'vibe_rider_configured': True,
     'vibe_active_step': 'course',
+    'vibe_optimize_requested': False,
 }
 
 

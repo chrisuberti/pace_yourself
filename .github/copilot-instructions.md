@@ -98,6 +98,8 @@ Domain-specific AI context lives under `skills/`. Load the relevant pack when wo
 - `skills/optimization-debug/` — pacing / W' / simulation diagnosis
 - `skills/streamlit-flow/` — editing `pages_vibe/` or session state
 - `skills/strava-data-path/` — OAuth, segments, activities, tokens
+- `skills/course-data-provenance/` — construct compliant public starter courses
+  from OSM geometry and open terrain elevation
 - `skills/notebook-to-app/` — promote a notebook prototype into the app
 - `skills/release-checklist/` — cut an MVP milestone
 

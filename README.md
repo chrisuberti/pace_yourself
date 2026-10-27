@@ -16,7 +16,7 @@ Legacy files under `archive/` are reference-only and are being deprecated in sta
 ## MVP Scope (3-4 Weeks)
 - Course load/import and segmentation
 - Starter courses usable before authentication: real OSM-based GPS/elevation
-  tracks selected from public segment references, plus schematic Zwift profiles
+  tracks selected from verified public route references and open terrain DEMs
 - Rider setup
 - Constant vs variable pacing comparison
 - Database-backed course persistence
@@ -26,6 +26,13 @@ Strava connection is optional for the core workflow. Guest users can load the
 shared course library or upload a CSV, apply the prefilled segmentation settings,
 and optimize with the prefilled or manually edited rider profile. Fetching new
 Strava segments and importing athlete data require authentication.
+
+The top workflow cards are both status summaries and navigation. Opening a later
+step fills any missing local starter-course, terrain-segmentation, and rider
+defaults. Optimize remains explicit: clicking its card or the rider's primary
+action starts optimization immediately. Course selections load in place for map
+and elevation review. Strava connection state and login stay visible in the
+header; privacy and destructive account actions live in the page footer.
 
 ## Setup
 1. Create and activate the project virtual environment:

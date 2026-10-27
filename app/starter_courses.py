@@ -25,6 +25,7 @@ class StarterCourse:
     course_type: str
     track_filename: str | None = None
     elevation_profile: tuple[tuple[float, float], ...] = ()
+    elevation_source: str = "normalized"
 
     @property
     def is_virtual(self) -> bool:
@@ -41,7 +42,7 @@ STARTER_COURSES = (
             "effort with steadily changing grade."
         ),
         distance_m=2490.0,
-        elevation_gain_m=133.0,
+        elevation_gain_m=137.0,
         segment_url="https://veloviewer.com/segments/527881",
         research_url=(
             "https://www.cyclist.co.uk/news/"
@@ -59,7 +60,7 @@ STARTER_COURSES = (
             "that reward controlled W' use."
         ),
         distance_m=2530.0,
-        elevation_gain_m=136.0,
+        elevation_gain_m=135.0,
         segment_url="https://veloviewer.com/segments/229781",
         research_url="https://epicclimbs.info/segments/229781",
         course_type="real",
@@ -70,83 +71,93 @@ STARTER_COURSES = (
         name="Central Park Full Loop",
         location="New York, New York",
         description=(
-            "A rolling loop with Harlem Hill, flats, and descents for repeated "
-            "W' depletion and recovery."
+            "The 86th Street-start full park loop, including Harlem Hill, the "
+            "west-side rollers, and the southern return."
         ),
-        distance_m=9986.0,
-        elevation_gain_m=88.0,
-        segment_url="https://veloviewer.com/segments/1532085",
+        distance_m=9866.14,
+        elevation_gain_m=70.0,
+        segment_url=(
+            "https://veloviewer.com/segment/1532085/"
+            "Central+Park+Full+Loop"
+        ),
         research_url="https://citibikenyc.com/rides/central-park-full-loop-temp",
         course_type="real",
         track_filename="central_park_full_loop.csv",
+        elevation_source="usgs_ned10m",
     ),
     StarterCourse(
         slug="prospect-park-loop",
         name="Prospect Park Loop",
         location="Brooklyn, New York",
         description=(
-            "A compact rolling circuit with a sustained rise and recovery "
-            "descent, well suited to quick optimizer experiments."
+            "The official counterclockwise Park Drive loop, with the sustained "
+            "east-side rise and long west-side recovery."
         ),
         distance_m=5395.0,
-        elevation_gain_m=38.0,
-        segment_url="https://veloviewer.com/segments/797660",
-        research_url="https://www.prospectpark.org/visit-the-park/things-to-do/biking/",
+        elevation_gain_m=42.0,
+        segment_url=(
+            "https://www.prospectpark.org/visit-the-park/"
+            "places-to-go/park-drive/"
+        ),
+        research_url="https://citibikenyc.com/rides/prospect-park-loop-temp",
         course_type="real",
         track_filename="prospect_park_loop.csv",
+        elevation_source="usgs_ned10m",
     ),
     StarterCourse(
-        slug="zwift-watopia-hilly-route",
-        name="Zwift Watopia Hilly Route",
-        location="Watopia (virtual)",
+        slug="mt-lemmon-cookie-cabin",
+        name="Mt. Lemmon to Cookie Cabin",
+        location="Tucson to Summerhaven, Arizona",
         description=(
-            "The classic punchy Watopia lap with a KOM, descent, rollers, and "
-            "flats for W' depletion and recovery."
+            "The Catalina Highway climb from the established Mt. Lemmon base "
+            "to the Cookie Cabin in Summerhaven."
         ),
-        distance_m=9100.0,
-        elevation_gain_m=109.0,
-        segment_url="https://veloviewer.com/segments/6150551",
-        research_url="https://whatsonzwift.com/world/watopia/route/hilly-route",
-        course_type="virtual",
-        elevation_profile=(
-            (0.0, 10.0),
-            (0.12, 10.0),
-            (0.22, 62.0),
-            (0.32, 14.0),
-            (0.48, 30.0),
-            (0.58, 18.0),
-            (0.70, 48.0),
-            (0.78, 22.0),
-            (0.90, 33.0),
-            (1.0, 10.0),
+        distance_m=39_490.0,
+        elevation_gain_m=1692.0,
+        segment_url=(
+            "https://www.openstreetmap.org/directions?"
+            "engine=fossgis_valhalla_bicycle&"
+            "route=32.30511%2C-110.74454%3B32.4414515%2C-110.7599221"
         ),
+        research_url="https://pjammcycling.com/climb/156.Mt-Lemmon",
+        course_type="real",
+        track_filename="mt_lemmon_cookie_cabin.csv",
+        elevation_source="usgs_ned10m",
     ),
     StarterCourse(
-        slug="zwift-watopia-figure-8",
-        name="Zwift Watopia Figure 8",
-        location="Watopia (virtual)",
+        slug="mercer-island-loop-ccw",
+        name="Mercer Island Loop CCW",
+        location="Mercer Island, Washington",
         description=(
-            "A longer rolling route with the Hilly KOM in both directions, "
-            "giving the optimizer multiple hard and recovery phases."
+            "The counterclockwise perimeter loop from Mercer Island Park & "
+            "Ride, following North, West, and East Mercer Way."
         ),
-        distance_m=29_700.0,
-        elevation_gain_m=254.0,
-        segment_url="https://veloviewer.com/segments/12118421",
-        research_url="https://whatsonzwift.com/world/watopia/route/figure-8",
-        course_type="virtual",
-        elevation_profile=(
-            (0.0, 20.0),
-            (0.10, 60.0),
-            (0.20, 30.0),
-            (0.30, 78.0),
-            (0.40, 25.0),
-            (0.52, 105.0),
-            (0.62, 35.0),
-            (0.73, 91.0),
-            (0.82, 30.0),
-            (0.91, 60.0),
-            (1.0, 20.0),
+        distance_m=21_680.0,
+        elevation_gain_m=123.0,
+        segment_url="https://ridewithgps.com/routes/28507876",
+        research_url=(
+            "https://seattlebikeroutes.wordpress.com/2023/03/20/"
+            "route-guide-mercer-island-loop/"
         ),
+        course_type="real",
+        track_filename="mercer_island_ccw.csv",
+        elevation_source="usgs_ned10m",
+    ),
+    StarterCourse(
+        slug="alpe-d-huez-official-683473",
+        name="Alpe d'Huez Official",
+        location="Bourg-d'Oisans, France",
+        description=(
+            "The complete official ascent through all 21 hairpins to the Tour "
+            "de France finish in Alpe d'Huez."
+        ),
+        distance_m=13_760.0,
+        elevation_gain_m=1109.0,
+        segment_url="https://veloviewer.com/segment/683473",
+        research_url="https://pjammcycling.com/climb/118.Alpe-dHuez",
+        course_type="real",
+        track_filename="alpe_d_huez_official.csv",
+        elevation_source="eu_dem25m",
     ),
 )
 

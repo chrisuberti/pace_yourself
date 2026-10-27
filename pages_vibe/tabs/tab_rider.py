@@ -35,6 +35,14 @@ def render() -> None:
     bike_label = "TT / Tri" if r.get('bike_type') == 'TT' else r['bike_type']
 
     _render_rider_identity(r)
+    if st.button(
+        "Optimize with This Profile",
+        type="primary",
+        width="stretch",
+    ):
+        _workflow.set_active_step('optimize')
+        st.rerun()
+
     if not st.session_state.get('auth_user_id'):
         st.info(
             "The prefilled rider profile is ready to use. Edit only the values "
@@ -62,10 +70,6 @@ def render() -> None:
         f"W' {r['w_prime'] / 1000:.0f}kJ · CdA {r['cda']:.3f}m² · "
         f"W/kg {r['critical_power'] / r['weight']:.2f}"
     )
-    if st.button("Continue to Optimize", type="primary", width="stretch"):
-        _workflow.set_active_step('optimize')
-        st.rerun()
-
 def _render_general(r: dict) -> None:
     _workflow.apply_pending_rider_weight()
     draft_defaults = {
@@ -433,7 +437,7 @@ def _render_rider_identity(r: dict) -> None:
             st.caption("No Strava athlete has been verified or cached.")
         else:
             st.caption(
-                "Using local session defaults. Connect Strava from the sidebar "
+                "Using local session defaults. Connect Strava from the footer "
                 "only if you want to import athlete data.")
 
     if not st.session_state.get('auth_user_id'):

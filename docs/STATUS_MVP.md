@@ -73,6 +73,14 @@ Integrated AppTest coverage verified the Course -> Segment -> Rider -> Optimize
 path and confirmed that opening a step or changing a draft control does not
 implicitly load a course, apply segmentation, fetch API data, or optimize.
 
+Layout refinement completed 2026-10-25: the workflow navigator and setup summary
+are consolidated into four interactive status cards. Any step can be opened;
+missing local course, terrain-segmentation, and rider defaults are prepared on
+forward navigation. Clicking Optimize is the explicit action that immediately
+starts a one-shot optimization. Course dropdown choices load in place so the map
+and elevation profile remain visible, primary Continue actions sit above long
+forms, and privacy/account controls now live in the page footer with no sidebar.
+
 Blocking defect completed 2026-08-08: recurring terrain clustering now uses
 robust gradient/circular-bearing features, preserves requested types during
 spatial cleanup, and exposes live tuning controls and diagnostics in Segment.
@@ -156,7 +164,8 @@ Implemented compliance controls:
 - The pre-OAuth screen explains the requested `read`,
   `activity:read_all`, and optional `profile:read_all` scopes; accepted scopes
   are persisted and incomplete grants show a reconnect action.
-- Privacy/data-use and support links remain available from the sidebar.
+- Privacy/data-use, support, logout, and disconnect controls remain available
+  from the page footer.
 - **Log out** remains non-destructive. **Disconnect Strava and delete my data**
   requires an explicit confirmation, calls Strava deauthorization, then deletes
   the local user and all cascading private data. If Strava is unavailable,
@@ -362,6 +371,9 @@ separated, shared-course database failure preserves the CSV workflow with an
 actionable error, and the developer deployment toolbar is removed. A live
 desktop and 390px-wide walkthrough verified no horizontal overflow and completed
 CSV Course -> default Segment -> default Rider -> Optimize without guidance.
+Public starter courses now exclude schematic Zwift approximations; verified
+real-world routes use OSM geometry with explicit normalized or open-DEM
+elevation provenance.
 
 ### Phase 5 - MVP Validation and Migration Decision
 - Add focused tests for workflow transitions, stale-result behavior, and action
